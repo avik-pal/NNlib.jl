@@ -10,9 +10,9 @@ function psize(p, x)
   end
 end
 
-function im2col_2d!{T}(img::AbstractArray{T,3}, col::AbstractArray{T,2}, width::Int, height::Int, channels::Int,
+function im2col_2d!(img::AbstractArray{T,3}, col::AbstractArray{T,2}, width::Int, height::Int, channels::Int,
   kernel_w::Int, kernel_h::Int, pad_w::Int, pad_h::Int, stride_w::Int, stride_h::Int,
-  dil_w::Int, dil_h::Int, mode::Int)
+  dil_w::Int, dil_h::Int, mode::Int) where T
 
   height_col = div(height + 2pad_h - (kernel_h - 1) * dil_h - 1, stride_h) + 1
   width_col = div(width + 2pad_w - (kernel_w - 1) * dil_w - 1, stride_w) + 1
@@ -42,9 +42,9 @@ function im2col_2d!{T}(img::AbstractArray{T,3}, col::AbstractArray{T,2}, width::
   end
 end
 
-function col2im_2d!{T}(col::AbstractArray{T,2}, img::AbstractArray{T,3}, width::Int, height::Int,
+function col2im_2d!(col::AbstractArray{T,2}, img::AbstractArray{T,3}, width::Int, height::Int,
   channels::Int, kernel_w::Int, kernel_h::Int, pad_w::Int, pad_h::Int, stride_w::Int,
-  stride_h::Int, dil_h::Int, dil_w::Int, mode::Int)
+  stride_h::Int, dil_h::Int, dil_w::Int, mode::Int) where T
 
   height_col = div(height + 2pad_h - (kernel_h - 1) * dil_h - 1, stride_h) + 1
   width_col = div(width + 2pad_w - (kernel_w - 1) * dil_w - 1, stride_w) + 1
@@ -71,9 +71,9 @@ function col2im_2d!{T}(col::AbstractArray{T,2}, img::AbstractArray{T,3}, width::
   end
 end
 
-function im2col_3d!{T}(img::AbstractArray{T,4}, col::AbstractArray{T,2}, width::Int, height::Int, depth::Int,
+function im2col_3d!(img::AbstractArray{T,4}, col::AbstractArray{T,2}, width::Int, height::Int, depth::Int,
   channels::Int, kernel_w::Int, kernel_h::Int, kernel_d::Int, pad_w::Int, pad_h::Int, pad_d::Int,
-  stride_w::Int, stride_h::Int, stride_d::Int, dil_w::Int, dil_h::Int, dil_d::Int, mode::Int)
+  stride_w::Int, stride_h::Int, stride_d::Int, dil_w::Int, dil_h::Int, dil_d::Int, mode::Int) where T
 
   height_col = div(height + 2pad_h - (kernel_h - 1) * dil_h - 1, stride_h) + 1
   width_col = div(width + 2pad_w - (kernel_w - 1) * dil_w - 1, stride_w) + 1
@@ -107,10 +107,10 @@ function im2col_3d!{T}(img::AbstractArray{T,4}, col::AbstractArray{T,2}, width::
   end
 end
 
-function col2im_3d!{T}(col::AbstractArray{T,2}, img::AbstractArray{T,4}, width::Int, height::Int,
+function col2im_3d!(col::AbstractArray{T,2}, img::AbstractArray{T,4}, width::Int, height::Int,
   depth::Int, channels::Int, kernel_w::Int, kernel_h::Int, kernel_d::Int,
   pad_w::Int, pad_h::Int, pad_d::Int, stride_w::Int, stride_h::Int, stride_d::Int,
-  dil_w::Int, dil_h::Int, dil_d::Int, mode::Int)
+  dil_w::Int, dil_h::Int, dil_d::Int, mode::Int) where T
 
   height_col = div(height + 2pad_h - (kernel_h - 1) * dil_h - 1, stride_h) + 1
   width_col = div(width + 2pad_w - (kernel_w - 1) * dil_w - 1, stride_w) + 1
@@ -171,8 +171,8 @@ function im2col_dims(w,y,dilation=1)
     return (r, c)
 end
 
-function conv2d!{T}(y::AbstractArray{T,4}, x::AbstractArray{T,4}, w::AbstractArray{T,4};
-                  padding=0, stride=1, dilation=1, mode=0, alpha=T(1))
+function conv2d!(y::AbstractArray{T,4}, x::AbstractArray{T,4}, w::AbstractArray{T,4};
+               padding=0, stride=1, dilation=1, mode=0, alpha=T(1)) where T
     if mode != 0 && mode != 1; throw(ArgumentError("conv2d only supports mode=0 or 1.")); end
     Wx,Hx,Cx,Nx = size(x)
     Ww,Hw,C1,C2 = dilation_dims(w, dilation)
@@ -193,8 +193,8 @@ function conv2d!{T}(y::AbstractArray{T,4}, x::AbstractArray{T,4}, w::AbstractArr
     return y
 end
 
-function conv2d_grad_w!{T}(dw::AbstractArray{T,4}, x::AbstractArray{T,4}, w::AbstractArray{T,4}, dy::AbstractArray{T,4};
-                   padding=0, stride=1, dilation=1, mode=0, alpha=1)
+function conv2d_grad_w!(dw::AbstractArray{T,4}, x::AbstractArray{T,4}, w::AbstractArray{T,4}, dy::AbstractArray{T,4};
+                   padding=0, stride=1, dilation=1, mode=0, alpha=1) where T
     # dw = x'*dy
     Wx,Hx,Cx,Nx = size(x)
     Ww,Hw,C1,C2 = dilation_dims(w, dilation)
@@ -218,8 +218,8 @@ function conv2d_grad_w!{T}(dw::AbstractArray{T,4}, x::AbstractArray{T,4}, w::Abs
     return dw
 end
 
-function conv2d_grad_x!{T}(dx::AbstractArray{T,4}, x::AbstractArray{T,4}, w::AbstractArray{T,4}, dy::AbstractArray{T,4};
-                   padding=0, stride=1, dilation=1, mode=0, alpha=1)
+function conv2d_grad_x!(dx::AbstractArray{T,4}, x::AbstractArray{T,4}, w::AbstractArray{T,4}, dy::AbstractArray{T,4};
+                   padding=0, stride=1, dilation=1, mode=0, alpha=1) where T
     # dx = dy*w'
     Wx,Hx,Cx,Nx = size(x)
     Ww,Hw,C1,C2 = dilation_dims(w, dilation)
@@ -262,8 +262,8 @@ function col2im2d!(w::AbstractArray{T,4}, x::AbstractArray{T,4}, x2::AbstractArr
     return x
 end
 
-function conv3d!{T}(y::AbstractArray{T,5}, x::AbstractArray{T,5}, w::AbstractArray{T,5};
-                  padding=0, stride=1, dilation = 1, mode=0, alpha=T(1))
+function conv3d!(y::AbstractArray{T,5}, x::AbstractArray{T,5}, w::AbstractArray{T,5};
+               padding=0, stride=1, dilation = 1, mode=0, alpha=T(1)) where T
     if mode != 0 && mode != 1; throw(ArgumentError("conv3d only supports mode=0 or 1.")); end
     Wx,Hx,Dx,Cx,Nx = size(x)
     Ww,Hw,Dw,C1,C2 = dilation_dims(w, dilation)
@@ -286,8 +286,8 @@ function conv3d!{T}(y::AbstractArray{T,5}, x::AbstractArray{T,5}, w::AbstractArr
     return y
 end
 
-function conv3d_grad_w!{T}(dw::AbstractArray{T,5}, x::AbstractArray{T,5}, w::AbstractArray{T,5}, dy::AbstractArray{T,5};
-                   padding=0, stride=1, dilation = 1, mode=0, alpha=1)
+function conv3d_grad_w!(dw::AbstractArray{T,5}, x::AbstractArray{T,5}, w::AbstractArray{T,5}, dy::AbstractArray{T,5};
+                   padding=0, stride=1, dilation = 1, mode=0, alpha=1) where T
     # dw = x'*dy
     Wx,Hx,Dx,Cx,Nx = size(x)
     Ww,Hw,Dw,C1,C2 = dilation_dims(w, dilation)
@@ -311,8 +311,8 @@ function conv3d_grad_w!{T}(dw::AbstractArray{T,5}, x::AbstractArray{T,5}, w::Abs
     return dw
 end
 
-function conv3d_grad_x!{T}(dx::AbstractArray{T,5}, x::AbstractArray{T,5}, w::AbstractArray{T,5}, dy::AbstractArray{T,5};
-                   padding=0, stride=1, dilation = 1, mode=0, alpha=1)
+function conv3d_grad_x!(dx::AbstractArray{T,5}, x::AbstractArray{T,5}, w::AbstractArray{T,5}, dy::AbstractArray{T,5};
+                   padding=0, stride=1, dilation = 1, mode=0, alpha=1) where T
     # dx = dy*w'
     Wx,Hx,Dx,Cx,Nx = size(x)
     Ww,Hw,Dw,C1,C2 = dilation_dims(w, dilation)

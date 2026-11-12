@@ -1,0 +1,212 @@
+# Shared setup loaded into every ParallelTestRunner worker via the `init_code`
+# block in `runtests.jl`. This holds the common imports and helpers that the
+# individual test files rely on (previously the preamble of `runtests.jl` plus
+# `test_utils.jl`, which has been folded in here).
+#
+# Backend packages (CUDA/AMDGPU/Metal) are NOT loaded here: GPU workers get them
+# either from the generated shared-suite entries or from the per-backend
+# `ext_*/test_setup.jl` files (see `runtests.jl`).
+
+# Centralized imports for the whole test suite (loaded into every worker). Only `NNlib`
+# is brought in wholesale; everything else lists the names it provides, and symbols used
+# only occasionally are left for qualified use at the call site (e.g. `NNlib.input_size`,
+# `LinearAlgebra.Diagonal`, `Statistics.var`, `Interpolations.Constant`).
+using NNlib
+# `scatter`/`gather` are `public` but not `export`ed by NNlib, and the scatter/gather
+# suites use them pervasively, so bring them into scope explicitly (rarely-used NNlib
+# internals are instead qualified at the call site, e.g. `NNlib.glu`).
+using NNlib: scatter, scatter!, gather, gather!
+using Test: Test, @test, @testset, @test_throws, @test_broken, @test_skip, @test_logs, @inferred
+using Statistics: Statistics, mean
+using Random: Random
+using LinearAlgebra: LinearAlgebra
+using Logging: Logging
+using InteractiveUtils: InteractiveUtils
+using BFloat16s: BFloat16
+using ChainRulesCore: rrule
+using ChainRulesTestUtils: ChainRulesTestUtils
+using Base.Broadcast: broadcasted
+using FiniteDifferences: FiniteDifferences
+using ForwardDiff: ForwardDiff
+using Zygote: Zygote, gradient
+using StableRNGs: StableRNG
+using Adapt: Adapt, adapt
+using ImageTransformations: ImageTransformations
+using Interpolations: Interpolations
+using KernelAbstractions: KernelAbstractions, CPU
+using FFTW: FFTW                # loads NNlibFFTWExt (stft/spectrogram)
+using ReverseDiff: ReverseDiff as RD   # used in `pooling.jl`
+using SpecialFunctions: SpecialFunctions  # loads NNlibSpecialFunctionsExt (gelu_erf)
+using ADTypes: AbstractADType, AutoZygote, AutoFiniteDifferences, AutoEnzyme, AutoMooncake
+using Functors: Functors
+using MLDataDevices: cpu_device, gpu_device
+using EnzymeCore: EnzymeCore, Active, Const, Duplicated, ReverseWithPrimal, ReverseSplitWithPrimal
+@static if HAS_ENZYME
+    using Enzyme: Enzyme
+    using EnzymeTestUtils: EnzymeTestUtils
+    @static if VERSION < v"1.11-"
+        # Avoid LLVM 15 compilation blowups: https://github.com/EnzymeAD/Enzyme.jl/issues/3883
+        Enzyme.Compiler.LLVM.clopts("-unswitch-threshold=0")
+    end
+end
+using Mooncake: Mooncake
+
+# While Mooncake ships its own copy of the rules for NNlib functions, NNlib's extension does
+# not load its own (see `ext/NNlibMooncakeExt`). Swap them in, so that the copy under test
+# is NNlib's. Mooncake's are deleted first: a rule missing from ours must not fall back to it.
+let ours = Base.get_extension(NNlib, :NNlibMooncakeExt),
+    theirs = Base.get_extension(Mooncake, :MooncakeNNlibExt)
+
+    # A worker loads this file once per test file it runs, and must swap only once.
+    if theirs !== nothing && !isempty(methods(Mooncake.rrule!!, theirs))
+        for f in (Mooncake.rrule!!, Mooncake.frule!!, Mooncake._is_primitive,
+                  NNlib.logsumexp, NNlib.σ, NNlib.sigmoid_fast)
+            foreach(Base.delete_method, methods(f, theirs))
+        end
+        Base.include(ours, joinpath(pkgdir(NNlib), "ext", "NNlibMooncakeExt", "rules.jl"))
+    end
+end
+
+const rng = StableRNG(123)
+
+cpu(x) = cpu_device()(x)
+
+### GRADIENTS
+
+function withgradient(f::F, adtype::AutoZygote, x::Vararg{Any,N}) where {F,N}
+    return Zygote.withgradient(f, x...)
+end
+
+_default_fdm() = FiniteDifferences.central_fdm(5, 1, max_range=1e-2)
+
+function withgradient(f::F, adtype::AutoFiniteDifferences, x::Vararg{Any,N}) where {F, N}
+    y = f(x...)
+    gs = FiniteDifferences.grad(adtype.fdm, x -> f(x...), x)[1]
+    return (; val = y, grad = gs)
+end
+
+
+function withgradient(f::F, adtype::AutoEnzyme, x::Vararg{Any,N}) where {F,N}
+    return _enzyme_withgradient(f, map(_trymake_duplicated, x)...)
+end
+
+_trymake_duplicated(x::Duplicated) = x
+_trymake_duplicated(x::Const) = x
+_trymake_duplicated(x::Active) = x
+# Scalars are immutable, so they can't accumulate gradient through a `Duplicated`
+# shadow; Enzyme returns them as `Active` derivatives instead.
+_trymake_duplicated(x::Number) = Active(x)
+_trymake_duplicated(x) = Duplicated(x, EnzymeCore.make_zero(x))
+
+# Shadows are used as given, so a caller-supplied `Duplicated` must carry a zeroed one.
+# Re-zeroing them with `remake_zero!` corrupts a `CuArray` shadow when Enzyme is loaded
+# before CUDA, as it is here (https://github.com/EnzymeAD/Enzyme.jl/issues/3806).
+function _enzyme_withgradient(f, args::Union{Const, Active, Duplicated}...)
+    ad = Enzyme.set_runtime_activity(ReverseWithPrimal)
+    # `autodiff` returns `((active_grads...,), primal)`; `Duplicated` grads land in
+    # their shadow, `Active` grads come back positionally in the first tuple.
+    derivs, result = Enzyme.autodiff(ad, Const(f), Active, args...)
+
+    di = 0
+    grad = map(args) do x
+        x isa Active ? derivs[di += 1] : _grad_or_nothing(x)
+    end
+    return (; val = result, grad)
+end
+
+# This function strips the returned gradient to be Zygote-like:
+_grad_or_nothing(dup::Duplicated) = Functors.fmapstructure(_grad_or_nothing, dup.dval; prune=nothing)
+_grad_or_nothing(::Const) = nothing
+_grad_or_nothing(x) = x
+
+function withgradient(f::F, adtype::AutoMooncake, args::Vararg{Any,N}) where {F,N}
+    config = Mooncake.Config(friendly_tangents=true)
+    cache = Mooncake.prepare_gradient_cache(f, args...; config)
+    val, grads = Mooncake.value_and_gradient!!(cache, f, args...)
+    return (val=val, grad=grads[2:end])
+end
+
+# Convert the floating-point arrays in `x` to Float64 precision (a local stand-in
+# for `Flux.f64`, so the tests don't depend on Flux). Recurses through Functors-
+# compatible containers; non-float leaves (ints, functions, ...) are left as-is.
+struct Float64Adaptor end
+Adapt.adapt_storage(::Float64Adaptor, x::AbstractArray{<:AbstractFloat}) =
+    convert(AbstractArray{Float64}, x)
+Adapt.adapt_storage(::Float64Adaptor, x::AbstractArray{<:Complex{<:AbstractFloat}}) =
+    convert(AbstractArray{Complex{Float64}}, x)
+f64(x) = Functors.fmap(adapt(Float64Adaptor()), x)
+
+function test_gradients(
+            f,
+            xs...;
+            rtol=1e-4, atol=1e-4,
+            test_gpu = false,
+            # On a GPU backend we only check the GPU gradient against the reference; the
+            # CPU-vs-reference comparison is already covered by the dedicated CPU run.
+            test_cpu = !test_gpu,
+            # Optional GPU-adapted version of `f`. Use when `f` captures CPU arrays
+            # that must also be on GPU (e.g. index arrays in gather/scatter). When
+            # `nothing`, `f` is used as-is on the GPU inputs (it is never moved to the
+            # GPU, since it captures only non-array config like `DenseConvDims`/kwargs).
+            f_gpu = nothing,
+            reference::AbstractADType = test_cpu ? AutoFiniteDifferences(;fdm=_default_fdm()) : AutoZygote(),
+            compare::Union{AbstractADType, Vector{<:AbstractADType}} = [AutoZygote(), AutoEnzyme()],
+            loss = (f, xs...) -> mean(f(xs...)),
+            )
+
+    @assert test_cpu || test_gpu "at least one of `test_cpu` or `test_gpu` must be true"
+
+    compares = compare isa AbstractADType ? [compare,] : compare
+    if !NNLIB_TEST_ENZYME
+        compares = filter(adtype -> !(adtype isa AutoEnzyme), compares)
+    end
+
+    cpu_dev = cpu_device()
+
+    if test_gpu
+        gpu_dev = gpu_device(force=true)
+        cpu_dev = cpu_device()
+        xs_gpu = xs |> gpu_dev
+        _f_gpu = isnothing(f_gpu) ? f : f_gpu
+    end
+
+    ## Let's make sure first that the forward pass works.
+    l = loss(f, xs...)
+    @assert l isa Number "loss should return a number, got $(typeof(l))"
+
+    # Compute reference gradients with inputs promoted to f64 precision.
+    y, gs = withgradient((xs...) -> loss(f, xs...), reference, f64(xs)...)
+    @assert isapprox(l, y; rtol, atol) "forward pass mismatch: $l ≉ $y (reference)"
+
+    if test_cpu
+        for adtype in compares
+            y2, gs2 = withgradient((xs...) -> loss(f, xs...), adtype, xs...)
+            @assert isapprox(l, y2; rtol, atol) "forward pass mismatch: $l ≉ $y2 (compare $adtype)"
+            check_equal(gs, gs2; rtol, atol)
+        end
+    end
+
+    if test_gpu
+        l_gpu = loss(_f_gpu, xs_gpu...)
+        @assert l_gpu isa Number "gpu loss should return a number, got $(typeof(l_gpu))"
+
+        # TODO fix Enzyme errors on Metal
+        gpu_compares = nameof(typeof(gpu_dev)) === :MetalDevice ?
+            filter(adtype -> !(adtype isa AutoEnzyme), compares) : compares
+
+        for adtype in gpu_compares
+            y_gpu, gs_gpu = withgradient((xs...) -> loss(_f_gpu, xs...), adtype, xs_gpu...)
+            @assert isapprox(l_gpu, y_gpu; rtol, atol) "gpu forward pass mismatch: $l_gpu ≉ $y_gpu (compare $adtype)"
+            check_equal(gs, gs_gpu |> cpu_dev; rtol, atol)
+        end
+    end
+
+    return true
+end
+
+function check_equal(a, b; rtol=1e-4, atol=1e-4)
+    for (x, y) in zip(a, b)
+        @assert isapprox(x, y; rtol, atol) "gradient mismatch: $x ≉ $y"
+    end
+    return true
+end

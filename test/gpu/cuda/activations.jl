@@ -1,0 +1,63 @@
+@testset "activation broadcast" begin
+    for f in NNlib.ACTIVATIONS
+        if f ∉ [:rrelu]
+            @eval @test test_gradients(x -> $f.(x), rand(Float64, 5); test_gpu=true)
+        end
+    end
+end
+
+@testset "forward diff" begin
+    for f in NNlib.ACTIVATIONS
+        if f ∉ [:rrelu]
+            @eval gputest(x -> $f.(x), Dual.(rand(5), 1))
+        end
+    end
+end
+
+# Broadcasting over complex CuArray works without NNlibCUDAExt, this test checks that
+# NNlibCUDAExt does not cause such operations to take a fast path which does not support
+# complex numbers (e.g. cuDNN)
+@testset "complex" begin
+    f(x) = tanh.(x)
+    cs = rand(ComplexF64, 5)
+    @test f(cs) ≈ collect(f(CuArray(cs)))
+end
+
+@testset "softplus" begin 
+  # softplus does not give `Inf` for large arguments
+   x = CuArray([1000.])
+   @test all(softplus.(x) .== x)
+end
+
+@testset "exp, expm1 and log1p are libdevice's in a kernel" begin
+    for T in (Float32, Float64)
+        x = CuArray(T.(range(-20, 20, length=10_000)))
+        t = CuArray(T.(range(0, 1, length=10_000)))
+        @test Array(NNlib._exp.(x)) == Array(exp.(x))
+        @test Array(NNlib._expm1.(x)) == Array(expm1.(x))
+        @test Array(NNlib._log1p_unit.(t)) == Array(log1p.(t))
+    end
+end
+
+@testset "input is preserved" begin
+    x = CUDA.ones(1)
+    @test Array(x) == [1f0]
+    tanh.(x)
+    @test Array(x) == [1f0]
+    y = tanh.(x)
+    @test Array(x) == [1f0]
+    @test Array(y) == [tanh(1f0)]
+    x .= tanh.(y)
+    @test Array(y) == [tanh(1f0)]
+    @test Array(x) == [tanh(tanh(1f0))]
+end
+
+@testset "fused act addition broadcast" begin
+    x = CUDA.rand(Float32, 10, 10)
+    b = CUDA.rand(Float32, 10)
+
+    for act in getfield.((NNlib,), NNlib.ACTIVATIONS)
+        fused_act_add = act ∘ +
+        @test fused_act_add.(x, b) ≈ act.(x .+ b)
+    end
+end

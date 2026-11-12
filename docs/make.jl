@@ -1,0 +1,26 @@
+using Documenter, NNlib
+
+DocMeta.setdocmeta!(NNlib, :DocTestSetup,
+    :(using FFTW, NNlib, UnicodePlots); recursive = true)
+
+makedocs(modules = [NNlib],
+    sitename = "NNlib.jl",
+    doctest = true,
+    pages = ["Home" => "index.md",
+             "Reference" => "reference.md",
+             "Audio" => "audio.md"],
+    format = Documenter.HTML(
+        canonical = "https://fluxml.ai/NNlib.jl/stable/",
+        # analytics = "UA-36890222-9",
+        assets = ["assets/flux.css"],
+        prettyurls = get(ENV, "CI", nothing) == "true",
+        size_threshold = 300 * 2^10),
+    warnonly=[:missing_docs,]
+)
+
+deploydocs(repo = "github.com/FluxML/NNlib.jl.git",
+           target = "build",
+           # PR previews are pushed with the `DOCUMENTER_KEY` deploy key. Dependabot PRs
+           # cannot read that secret and their `GITHUB_TOKEN` is read-only, so pushing a
+           # preview from them fails with a 403: only build the docs there.
+           push_preview = !isempty(get(ENV, "DOCUMENTER_KEY", "")))

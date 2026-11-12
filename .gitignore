@@ -11,5 +11,10 @@ deps/usr
 deps.jl
 *.log
 .vscode/
-/Manifest.toml
-lib/NNlibCUDA/Manifest.toml
+Manifest*.toml
+benchmark/*.json
+benchmark/others/*.json
+benchmark/others/report.md
+uv.lock
+.python-version
+

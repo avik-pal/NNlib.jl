@@ -1,5 +1,3 @@
-using LinearAlgebra
-
 import Base: -
 import Adapt: adapt_structure, adapt
 
@@ -89,6 +87,7 @@ function Base.stride(A::Union{BatchedTranspose, BatchedAdjoint{<:Real}}, d::Inte
     Base.stride(A.parent, d)
 end
 
+Base.pointer(A::BatchedAdjOrTrans) = pointer(parent(A))
 Base.unsafe_convert(::Type{Ptr{T}}, A::BatchedAdjOrTrans{T}) where {T} =
     Base.unsafe_convert(Ptr{T}, parent(A))
 
@@ -104,3 +103,9 @@ end
 
 adapt_structure(to, x::BatchedAdjoint) = BatchedAdjoint(adapt(to, parent(x)))
 adapt_structure(to, x::BatchedTranspose) = BatchedTranspose(adapt(to, parent(x)))
+
+Broadcast.BroadcastStyle(::Type{<:BatchedAdjOrTrans{T, S}}) where {T, S} = Broadcast.BroadcastStyle(S)
+# A reshaped transpose, as the cotangent of a transpose of a reshape, also broadcasts on the
+# device of its parent: Zygote adds two of them.
+Broadcast.BroadcastStyle(::Type{<:Base.ReshapedArray{T, N, P}}) where {T, N, P<:BatchedAdjOrTrans} =
+    typeof(Broadcast.BroadcastStyle(P))(Val(N))

@@ -1,10 +1,13 @@
 ## Low level gemm! call with pointers
 ## Borrowed from Knet.jl, adapted for compile-time constants
 
-using LinearAlgebra
-using LinearAlgebra.BLAS: libblas, BlasInt, @blasfunc
+using LinearAlgebra.BLAS: get_num_threads, set_num_threads
 
-using Compat: get_num_threads, set_num_threads # needs Compat 3.13, for any Julia < 1.6
+if isdefined(LinearAlgebra.BLAS, :libblastrampoline)
+    const libblas = LinearAlgebra.BLAS.libblastrampoline
+else
+    const libblas = Base.libblas_name
+end
 
 """
     gemm!()
@@ -35,7 +38,7 @@ for (gemm, elt) in gemm_datatype_mappings
                                beta::$(elt), C::Ptr{$elt})
             # Convert our compile-time transpose marker to a char for BLAS
             convtrans(V::Val{false}) = 'N'
-            convtrans(V::Val{true})  = 'T'
+            convtrans(V::Val{true})  = 'C'
 
             if transA == Val(false)
                 lda = M
@@ -48,6 +51,30 @@ for (gemm, elt) in gemm_datatype_mappings
                 ldb = N
             end
             ldc = M
+            ccall((@blasfunc($(gemm)), libblas), Nothing,
+                  (Ref{UInt8}, Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt},
+                   Ref{BlasInt}, Ref{$elt}, Ptr{$elt}, Ref{BlasInt},
+                   Ptr{$elt}, Ref{BlasInt}, Ref{$elt}, Ptr{$elt},
+                   Ref{BlasInt}),
+                  convtrans(transA), convtrans(transB), M, N, K,
+                  alpha, A, lda, B, ldb, beta, C, ldc)
+        end
+    end
+end
+
+# Variant with explicit leading dimensions. This lets a caller multiply a
+# sub-block of `A`/`C` in place (e.g. a contiguous slice of the output spatial
+# dimension) without copying, by passing the full leading dimension while
+# giving a reduced row count `M` and pre-offset pointers.
+for (gemm, elt) in gemm_datatype_mappings
+    @eval begin
+        @inline function gemm!(transA::Val, transB::Val,
+                               M::Int, N::Int, K::Int,
+                               alpha::$(elt), A::Ptr{$elt}, lda::Int,
+                               B::Ptr{$elt}, ldb::Int,
+                               beta::$(elt), C::Ptr{$elt}, ldc::Int)
+            convtrans(V::Val{false}) = 'N'
+            convtrans(V::Val{true})  = 'C'
             ccall((@blasfunc($(gemm)), libblas), Nothing,
                   (Ref{UInt8}, Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt},
                    Ref{BlasInt}, Ref{$elt}, Ptr{$elt}, Ref{BlasInt},
@@ -83,15 +110,17 @@ for (gemm, elt) in gemm_datatype_mappings
             LinearAlgebra.BLAS.chkstride1(B)
             LinearAlgebra.BLAS.chkstride1(C)
 
-            ptrA = Base.unsafe_convert(Ptr{$elt}, A)
-            ptrB = Base.unsafe_convert(Ptr{$elt}, B)
-            ptrC = Base.unsafe_convert(Ptr{$elt}, C)
+            ptrA = pointer(A)
+            ptrB = pointer(B)
+            ptrC = pointer(C)
 
             strA = size(A, 3) == 1 ? 0 : Base.stride(A, 3)
             strB = size(B, 3) == 1 ? 0 : Base.stride(B, 3)
             strC = Base.stride(C, 3)
 
-            n_threads = min(Threads.nthreads(), 1 + max(length(A), length(B)) ÷ 8000)
+            n_threads = min(
+                Threads.nthreads(:default),
+                1 + max(length(A), length(B)) ÷ 8000)
             # In some tests, size (20,20,20) is worth splitting between two threads,
             # as is size (32,32,8).
 
@@ -99,22 +128,34 @@ for (gemm, elt) in gemm_datatype_mappings
 
                 old_threads = get_num_threads()
                 set_num_threads(1)
-                Threads.@sync for ks in Iterators.partition(1:size(C, 3), cld(size(C, 3), n_threads))
-                    Threads.@spawn for k in ks
+
+                parts = Iterators.partition(1:size(C, 3), cld(size(C, 3), n_threads))
+
+                function gemm!_part(ks)
+                    for k in ks
 
                         ptrAk = ptrA + (k-1) * strA * sizeof($elt)
                         ptrBk = ptrB + (k-1) * strB * sizeof($elt)
                         ptrCk = ptrC + (k-1) * strC * sizeof($elt)
 
                         ccall((@blasfunc($(gemm)), libblas), Nothing,
-                              (Ref{UInt8}, Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt},
-                               Ref{BlasInt}, Ref{$elt}, Ptr{$elt}, Ref{BlasInt},
-                               Ptr{$elt}, Ref{BlasInt}, Ref{$elt}, Ptr{$elt},
-                               Ref{BlasInt}),
-                              transA, transB, m, n,
-                              ka, alpha, ptrAk, max(1,Base.stride(A,2)),
-                              ptrBk, max(1,Base.stride(B,2)), beta, ptrCk,
-                              max(1,Base.stride(C,2)))
+                            (Ref{UInt8}, Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt},
+                            Ref{BlasInt}, Ref{$elt}, Ptr{$elt}, Ref{BlasInt},
+                            Ptr{$elt}, Ref{BlasInt}, Ref{$elt}, Ptr{$elt},
+                            Ref{BlasInt}),
+                            transA, transB, m, n,
+                            ka, alpha, ptrAk, max(1,Base.stride(A,2)),
+                            ptrBk, max(1,Base.stride(B,2)), beta, ptrCk,
+                            max(1,Base.stride(C,2)))
+                    end
+                end
+                if should_use_spawn() && length(parts) > 1
+                    Threads.@sync for ks in parts
+                        Threads.@spawn gemm!_part(ks)
+                    end
+                else
+                    for ks in parts
+                        gemm!_part(ks)
                     end
                 end
                 set_num_threads(old_threads)
@@ -141,7 +182,7 @@ for (gemm, elt) in gemm_datatype_mappings
 
             end
 
-            C
+            return C
         end
     end
 end

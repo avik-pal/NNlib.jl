@@ -1,17 +1,128 @@
 ## This file contains im2col-backed implementations of convolution for 2d and 3d
 ## convolutions.  Expect to see a lot of indexing.
 
-# Helper functions for flipkernel-induced dyslexia
-@inline function kernel_index(w, h, d, cdims::ConvDims{N, S, P, D, false}) where {N, S, P, D}
+# Helper function for flipkernel-induced dyslexia
+function kernel_index(w, h, d, cdims::ConvDims)
+    flipkernel(cdims) && return (w, h, d)
     kernel_w, kernel_h, kernel_d = kernel_size(cdims)
     return (kernel_w - w + 1, kernel_h - h + 1, kernel_d - d + 1)
 end
-@inline function kernel_index(w, h, d, cdim::ConvDims{N, S, P, D, true}) where {N, S, P, D}
-    return (w, h, d)
+
+# The im2col matrix of an image has one row per output position, too many to hold once
+# per task on large images (#864). It is filled and multiplied in tiles of consecutive
+# rows instead, each task reusing one `(rows, K)` slice of the workspace `col`. Tasks pin
+# BLAS to one thread and keep their tiles of `IM2COL_TILE_BYTES` in cache, while a lone
+# task leaves its GEMMs to BLAS threads, which need much bigger ones. The floor amortizes
+# BLAS packing the other operand for every tile.
+const IM2COL_TILE_BYTES = 2^19
+const IM2COL_BLAS_TILE_BYTES = 2^27
+const IM2COL_MIN_TILE_ROWS = 64
+
+function im2col_tile_rows(M, K, ::Type{T}, nt) where {T}
+    bytes = nt > 1 || get_num_threads() == 1 ? IM2COL_TILE_BYTES : IM2COL_BLAS_TILE_BYTES
+    return min(max(bytes ÷ (K * sizeof(T)), IM2COL_MIN_TILE_ROWS), M)
+end
+
+# Tasks for an im2col op on `cdims` over `nbatch` images: at most `ntasks`, each with at
+# least `IM2COL_MIN_TASK_WORK` multiply-adds to pay for spawning it.
+const IM2COL_MIN_TASK_WORK = 2^21
+
+function im2col_ntasks(cdims::ConvDims, nbatch, ntasks)
+    should_use_spawn() || return 1
+    work = nbatch * prod(output_size(cdims)) * prod(kernel_size(cdims)) *
+           channels_in(cdims) * channels_out(cdims)
+    return clamp(cld(work, IM2COL_MIN_TASK_WORK), 1, ntasks)
+end
+
+# Workspace of `conv_im2col!`, whose tasks share the tiles of all images: these are cut
+# finely enough to give every task work when there are fewer images than tasks.
+function conv_im2col_dims(cdims::ConvDims, ::Type{T}, nbatch, ntasks) where {T}
+    M = prod(output_size(cdims))
+    K = prod(kernel_size(cdims)) * channels_in(cdims)
+    ntasks = im2col_ntasks(cdims, nbatch, ntasks)
+    rows = im2col_tile_rows(M, K, T, ntasks)
+    if ntasks > nbatch > 0
+        rows = min(rows, cld(M, cld(ntasks, nbatch)))
+    end
+    nt = clamp(nbatch * cld(M, rows), 1, ntasks)
+    return nt > 1 ? (rows, K, nt) : (im2col_tile_rows(M, K, T, 1), K, 1)
+end
+
+# `∇conv_data_im2col!` threads over slabs of `blk` indices along the outermost output
+# axis `ax` with extent > 1. `col2im!` adds each slab into the inputs under it, so slabs
+# are long enough that two slabs apart never add into the same input.
+function ∇conv_data_im2col_slabs(cdims::ConvDims, nbatch, ntasks)
+    out = output_size(cdims)
+    ax = out[3] > 1 ? 3 : out[2] > 1 ? 2 : 1
+    ntasks = im2col_ntasks(cdims, nbatch, ntasks)
+    # The odd and the even slabs run in turn, so twice as many keep every task busy.
+    nslab = ntasks > nbatch > 0 ? 2 * cld(ntasks, nbatch) : 1
+    halo = fld((kernel_size(cdims)[ax] - 1) * dilation(cdims)[ax], stride(cdims)[ax])
+    blk = max(halo, cld(out[ax], nslab), 1)
+    return ax, blk, cld(out[ax], blk)
+end
+
+axis_stride(out, ax) = ax == 1 ? 1 : ax == 2 ? out[1] : out[1]*out[2]
+
+function ∇conv_data_im2col_dims(cdims::ConvDims, ::Type{T}, nbatch, ntasks) where {T}
+    out = output_size(cdims)
+    K = prod(kernel_size(cdims)) * channels_in(cdims)
+    ax, blk, nslab = ∇conv_data_im2col_slabs(cdims, nbatch, ntasks)
+    nt = clamp(nbatch * cld(nslab, 2), 1, im2col_ntasks(cdims, nbatch, ntasks))
+    rows = im2col_tile_rows(blk * axis_stride(out, ax), K, T, nt)
+    return rows, K, nt
+end
+
+# `∇conv_filter_im2col!` threads over the tiles of all images, each task adding into its
+# own copy of `dw`. Each task gets at least as many output positions as `dw` has columns
+# (and `IM2COL_MIN_TASK_ROWS`), so the copies take less memory than the im2col matrix of
+# the batch and summing them costs little next to the GEMMs.
+const IM2COL_MIN_TASK_ROWS = 256
+
+function ∇conv_filter_im2col_dims(cdims::ConvDims, ::Type{T}, nbatch, ntasks) where {T}
+    M = prod(output_size(cdims))
+    K = prod(kernel_size(cdims)) * channels_in(cdims)
+    nt = clamp(nbatch * M ÷ max(IM2COL_MIN_TASK_ROWS, channels_out(cdims)), 1,
+               im2col_ntasks(cdims, nbatch, ntasks))
+    nt == 1 && return im2col_tile_rows(M, K, T, 1), K, 1
+    rows = im2col_tile_rows(M, K, T, nt)
+    if nt > nbatch
+        rows = min(rows, cld(M, cld(nt, nbatch)))
+    end
+    return rows, K, clamp(nbatch * cld(M, rows), 1, nt)
+end
+
+# Splits `1:nunits` into contiguous chunks for up to `nt` tasks, calling `f(i, chunk)` for
+# the `i`-th, and returns the number of chunks.
+function foreach_im2col_chunk(f, nunits, nt)
+    if !should_use_spawn() || nt <= 1 || nunits <= 1
+        f(1, 1:nunits)
+        return 1
+    end
+    chunks = Iterators.partition(1:nunits, cld(nunits, nt))
+    with_single_threaded_blas() do
+        @sync for (i, us) in enumerate(chunks)
+            Threads.@spawn f(i, us)
+        end
+    end
+    return length(chunks)
+end
+
+scale!(x, beta) = iszero(beta) ? fill!(x, zero(beta)) : isone(beta) ? x : (x .*= beta)
+
+# Tasks that each run their own GEMMs pin BLAS to one thread to avoid oversubscription.
+function with_single_threaded_blas(f)
+    old = get_num_threads()
+    set_num_threads(1)
+    try
+        return f()
+    finally
+        set_num_threads(old)
+    end
 end
 
 """
-    conv_im2col!(y, x, w, cdims, col=similar(x); alpha=1, beta=0)
+    conv_im2col!(y, x, w, cdims; col=nothing, alpha=1, beta=0, ntasks=nthreads())
 
 Perform a convolution using im2col and GEMM, store the result in `y`.  The  kwargs
 `alpha` and `beta` control accumulation behavior; internally this operation is
@@ -19,14 +130,16 @@ implemented as a matrix multiply that boils down to `y = alpha * x * w + beta * 
 by setting `beta` to a nonzero value, multiple results can be accumulated into `y`, or
 by setting `alpha` to a nonunitary value, various gain factors can be applied.
 
-Note for the particularly performance-minded, you can provide a pre-allocated `col`,
-which should eliminate any need for large allocations within this method.
+Note for the particularly performance-minded, you can provide a pre-allocated workspace
+`col` of size `(rows, K, ntasks)`, see `conv_im2col_dims`; each of up to `size(col, 3)`
+tasks processes the output positions `rows` at a time.
 """
 function conv_im2col!(
                 y::AbstractArray{T,5}, x::AbstractArray{T,5},
                 w::AbstractArray{T,5}, cdims::DenseConvDims;
-                col::AbstractArray{T,3}=similar(x, im2col_dims(cdims)),
-                alpha::T=T(1), beta::T=T(0)) where {T}
+                col::Union{Nothing,AbstractArray{T,3}}=nothing,
+                alpha::T=T(1), beta::T=T(0),
+                ntasks::Int=nthreads()) where {T}
     check_dims(size(x), size(w), size(y), cdims)
 
     #   COL   *    W    ->    Y
@@ -45,33 +158,47 @@ function conv_im2col!(
     M = prod(output_size(cdims))
     N = channels_out(cdims)
     K = prod(kernel_size(cdims))*channels_in(cdims)
-    
-    @threads for batch_idx in 1:size(x,5)
-        # col_slice is a thread-local workspace
-        col_slice = view(col, :, :, threadid())
 
-        im2col!(col_slice, view(x, :, :, :, :, batch_idx), cdims)
-        GC.@preserve col_slice w y begin
-            col_ptr = pointer(col_slice)
-            w_ptr = pointer(w)
-            y_ptr = pointer(y, (batch_idx - 1)*M*N + 1)
-            gemm!(Val(false), Val(false), M, N, K, alpha, col_ptr, w_ptr, beta, y_ptr)
+    nbatch = size(x, 5)
+    # Zero-sized batch: `y` already has the correct (…, 0) shape and no elements
+    # to write. See issue #760.
+    nbatch == 0 && return y
+
+    ws_rows, _, nt = conv_im2col_dims(cdims, T, nbatch, ntasks)
+    col = col === nothing ? similar(x, ws_rows, K, nt) : col
+    rows = min(ws_rows, size(col, 1))
+    ntiles = cld(M, rows)
+
+    # Unit `u` fills and multiplies the output positions `m` of image `n`; units write
+    # disjoint rows of `y`.
+    foreach_im2col_chunk(nbatch*ntiles, min(nt, size(col, 3))) do i, us
+        ws = view(col, :, :, i)
+        for u in us
+            n, t = fldmod1(u, ntiles)
+            m = (t - 1)*rows + 1 : min(t*rows, M)
+            im2col!(ws, view(x, :, :, :, :, n), cdims, m)
+            GC.@preserve ws w y begin
+                gemm!(Val(false), Val(false), length(m), N, K, alpha,
+                      pointer(ws), Base.stride(ws, 2), pointer(w), K, beta,
+                      pointer(y, (n - 1)*M*N + first(m)), M)
+            end
         end
     end
     return y
 end
 
 """
-    ∇conv_filter_im2col!(dw, x, dy, cdims, col=similar(dw); alpha=1, beta=0)
+    ∇conv_filter_im2col!(dw, x, dy, cdims; col=nothing, alpha=1, beta=0, ntasks=nthreads())
 
 Conv backward pass onto the weights using im2col and GEMM; stores the result in `dw`.
-See the documentation for `conv_im2col!()` for explanation of optional parameters.
+See [`conv_im2col!`](@ref) for explanation of optional parameters.
 """
 function ∇conv_filter_im2col!(
                 dw::AbstractArray{T,5}, x::AbstractArray{T,5},
                 dy::AbstractArray{T,5}, cdims::DenseConvDims;
-                col::AbstractArray{T,3} = similar(dw, im2col_dims(cdims)),
-                alpha::T=T(1), beta::T=T(0)) where {T}
+                col::Union{Nothing,AbstractArray{T,3}}=nothing,
+                alpha::T=T(1), beta::T=T(0),
+                ntasks::Int=nthreads()) where {T}
     check_dims(size(x), size(dw), size(dy), cdims)
 
     #   COL'   *   dY   ->    dW
@@ -89,41 +216,77 @@ function ∇conv_filter_im2col!(
     # input pixel that touched a particular element of the kernel.
     #
     # This is identical to a convolution between x and a dimension-permuted dY,
-    # where we 
-    
+    # where we
+
     M = prod(kernel_size(cdims))*channels_in(cdims)
     N = channels_out(cdims)
     K = prod(output_size(cdims))
-    
-    for batch_idx in 1:size(x,5)
-        col_slice = view(col, :, :, 1)
 
-        im2col!(col_slice, view(x, :, :, :, :, batch_idx), cdims)
-        GC.@preserve col_slice dw dy begin
-            col_ptr = pointer(col_slice)
-            dy_ptr = pointer(dy,(batch_idx - 1)*K*N + 1)
-            dw_ptr = pointer(dw)
-            gemm!(Val(true), Val(false), M, N, K, alpha, col_ptr, dy_ptr, beta, dw_ptr)
+    # Zero-sized batch: nothing to accumulate, so the result is just `beta*dw`.
+    # Unlike the forward/data paths, `dw` is not empty here, and the loop below
+    # would otherwise leave it untouched (uninitialized when beta==0). Mirror
+    # GEMM's write-only semantics for beta==0 by zeroing it outright. See #760.
+    if size(x, 5) == 0
+        return iszero(beta) ? fill!(dw, zero(T)) : (dw .*= beta)
+    end
+
+    nbatch = size(x, 5)
+    ws_rows, _, nt = ∇conv_filter_im2col_dims(cdims, T, nbatch, ntasks)
+    col = col === nothing ? similar(dw, ws_rows, M, nt) : col
+    rows = min(ws_rows, size(col, 1))
+    ntiles = cld(K, rows)
+    nunits = nbatch*ntiles
+
+    # Adds the tiles `us` into the `M × N` matrix at `acc`, scaled by `b` first.
+    function tiles!(acc, b, ws, us)
+        for u in us
+            n, t = fldmod1(u, ntiles)
+            ks = (t - 1)*rows + 1 : min(t*rows, K)
+            im2col!(ws, view(x, :, :, :, :, n), cdims, ks)
+            GC.@preserve ws dy begin
+                gemm!(Val(true), Val(false), M, N, length(ks), alpha,
+                      pointer(ws), Base.stride(ws, 2), pointer(dy, (n - 1)*K*N + first(ks)), K,
+                      b, acc, M)
+            end
+            b = T(1)
         end
+    end
+    nt = min(nt, size(col, 3))
+    if nt == 1
+        GC.@preserve dw tiles!(pointer(dw), beta, view(col, :, :, 1), 1:nunits)
+        return dw
+    end
 
-        # Because we accumulate over batches in this loop, we must set `beta` equal
-        # to `1.0` from this point on.
-        beta = T(1)
+    # Task `i > 1` adds into its own copy of `dw`, summed into `dw` at the end.
+    partials = similar(dw, M, N, nt - 1)
+    nchunks = foreach_im2col_chunk(nunits, nt) do i, us
+        GC.@preserve dw partials begin
+            acc = i == 1 ? pointer(dw) : pointer(partials, (i - 2)*M*N + 1)
+            tiles!(acc, i == 1 ? beta : T(0), view(col, :, :, i), us)
+        end
+    end
+    if nchunks > 1
+        foreach_im2col_chunk(M*N, nt) do _, ls
+            @inbounds for j in 1:nchunks-1, l in ls
+                dw[l] += partials[l + (j - 1)*M*N]
+            end
+        end
     end
     return dw
 end
 
 """
-    ∇conv_data_im2col!(dx, w, dy, cdims, col=similar(dx); alpha=1, beta=0)
+    ∇conv_data_im2col!(dx, w, dy, cdims; col=nothing, alpha=1, beta=0, ntasks=nthreads())
 
 Conv2d backward pass onto the input using im2col and GEMM; stores the result in `dx`.
-See the documentation for `conv_im2col!()` for explanation of other parameters.
+See [`conv_im2col!`](@ref) for explanation of optional parameters.
 """
 function ∇conv_data_im2col!(
                 dx::AbstractArray{T,5}, dy::AbstractArray{T,5},
                 w::AbstractArray{T,5}, cdims::DenseConvDims;
-                col::AbstractArray{T,3} = similar(dx, im2col_dims(cdims)),
-                alpha::T=T(1), beta::T=T(0)) where {T}
+                col::Union{Nothing,AbstractArray{T,3}}=nothing,
+                alpha::T=T(1), beta::T=T(0),
+                ntasks::Int=nthreads()) where {T}
     check_dims(size(dx), size(w), size(dy), cdims)
 
     #    dY        W'   ->    dX
@@ -145,36 +308,98 @@ function ∇conv_data_im2col!(
     N = prod(kernel_size(cdims))*channels_in(cdims)
     K = channels_out(cdims)
 
-    @threads for batch_idx in 1:size(dx, 5)
-        # col_slice is a thread-local workspace
-        col_slice = view(col, :, :, threadid())
+    nbatch = size(dx, 5)
+    # Zero-sized batch: `dx` already has the correct (…, 0) shape and no elements
+    # to write. See #760.
+    nbatch == 0 && return dx
 
-        GC.@preserve col_slice w dy begin
-            dy_ptr = pointer(dy, (batch_idx - 1)*M*K + 1)
-            w_ptr = pointer(w)
-            col_ptr = pointer(col_slice)
-            gemm!(Val(false), Val(true), M, N, K, alpha, dy_ptr, w_ptr, T(0), col_ptr)
+    ws_rows, _, nt = ∇conv_data_im2col_dims(cdims, T, nbatch, ntasks)
+    col = col === nothing ? similar(dx, ws_rows, N, nt) : col
+    rows = min(ws_rows, size(col, 1))
+    ax, blk, nslab = ∇conv_data_im2col_slabs(cdims, nbatch, ntasks)
+    out_len = output_size(cdims)[ax]
+    in_len = input_size(cdims)[ax]
+    stride_ax = axis_stride(output_size(cdims), ax)
+    k_ax, s_ax, dil_ax = kernel_size(cdims)[ax], stride(cdims)[ax], dilation(cdims)[ax]
+    pad_ax = padding(cdims)[2ax - 1]
+    # Last input index along `ax` that slab `j` adds into.
+    last_input(j) = clamp((min(j*blk, out_len) - 1)*s_ax - pad_ax + 1 + (k_ax - 1)*dil_ax,
+                          0, in_len)
+
+    function slab!(ws, n, j)
+        dxn = view(dx, :, :, :, :, n)
+        if isodd(j)
+            # Scale by `beta` the inputs from past the previous odd slab's up to the end
+            # of this one's (or of the image): all of `dx`, before the even slabs run.
+            lo = j == 1 ? 1 : last_input(j - 2) + 1
+            hi = j + 2 > nslab ? in_len : last_input(j)
+            if lo == 1 && hi == in_len
+                scale!(dxn, beta)
+            else
+                scale!(view(dxn, ntuple(i -> i == ax ? (lo:hi) : (1:size(dxn, i)), 4)...), beta)
+            end
         end
-        col2im!(view(dx, :, :, :, :, batch_idx), col_slice, cdims)
+        ms = (j - 1)*blk*stride_ax + 1 : min(j*blk, out_len)*stride_ax
+        for m0 in first(ms):rows:last(ms)
+            m = m0:min(m0 + rows - 1, last(ms))
+            GC.@preserve ws w dy begin
+                gemm!(Val(false), Val(true), length(m), N, K, alpha,
+                      pointer(dy, (n - 1)*M*K + first(m)), M, pointer(w), N,
+                      T(0), pointer(ws), Base.stride(ws, 2))
+            end
+            col2im!(dxn, ws, cdims, T(1), m)
+        end
+    end
+    # Slabs two apart add into disjoint inputs: the odd slabs of all images run in
+    # parallel, then the even ones.
+    for parity in 1:2
+        per = fld(nslab - parity, 2) + 1
+        foreach_im2col_chunk(nbatch*per, min(nt, size(col, 3))) do i, us
+            ws = view(col, :, :, i)
+            for u in us
+                n, j = fldmod1(u, per)
+                slab!(ws, n, parity + 2(j - 1))
+            end
+        end
     end
     return dx
 end
 
 
+_isect(a, b) = max(first(a), first(b)):min(last(a), last(b))
 
+const EMPTY_BOX = (1:0, 1:0, 1:0)
 
+# The output positions `rows` of an image, flattened over `(w, h, d)`, as five boxes of
+# `(w, h, d)` ranges, some empty: the rest of the first line, the rest of its plane, the
+# planes in between, the start of the last plane, and the start of the last line.
+function tile_boxes(rows::UnitRange{Int}, out_w, out_h)
+    l_lo, l_hi = fld1(first(rows), out_w), fld1(last(rows), out_w)
+    h_lo, d_lo = mod1(l_lo, out_h), fld1(l_lo, out_h)
+    h_hi, d_hi = mod1(l_hi, out_h), fld1(l_hi, out_h)
+    w_lo, w_hi = first(rows) - (l_lo - 1)*out_w, last(rows) - (l_hi - 1)*out_w
+    l_lo == l_hi && return ((w_lo:w_hi, h_lo:h_lo, d_lo:d_lo),
+                            EMPTY_BOX, EMPTY_BOX, EMPTY_BOX, EMPTY_BOX)
+    first_line = (w_lo:out_w, h_lo:h_lo, d_lo:d_lo)
+    last_line = (1:w_hi, h_hi:h_hi, d_hi:d_hi)
+    d_lo == d_hi && return (first_line, (1:out_w, h_lo+1:h_hi-1, d_lo:d_lo),
+                            EMPTY_BOX, EMPTY_BOX, last_line)
+    return (first_line, (1:out_w, h_lo+1:out_h, d_lo:d_lo),
+            (1:out_w, 1:out_h, d_lo+1:d_hi-1), (1:out_w, 1:h_hi-1, d_hi:d_hi), last_line)
+end
 
 """
-    im2col!(col, x, cdims)
+    im2col!(col, x, cdims, rows=1:M)
 
 Converts a 3d image `x` into a matrix `col` for usage with GEMM-calculated convolution.
 Patches of `x` of size (kernel_w, kernel_h, kernel_d, C_in) will be extracted and laid
-out along the rows of `col`, one for each output pixel.  This routine is used by all
-im2col-based convolutions, just with extra singleton dimensions added in the case of `2d`
-or `1d` images.
+out along the rows of `col`, one for each output pixel.  Only the output pixels `rows`
+(out of the `M` of the image, flattened) are extracted, into the first `length(rows)`
+rows of `col`.  This routine is used by all im2col-based convolutions, just with extra
+singleton dimensions added in the case of `2d` or `1d` images.
 """
-function im2col!(col::AbstractArray{T,2}, x::AbstractArray{T,4},
-                                          cdims::ConvDims) where {T}
+function im2col!(col::AbstractArray{T,2}, x::AbstractArray{T,4}, cdims::ConvDims,
+                 rows::UnitRange{Int}=1:prod(output_size(cdims))) where {T}
     if spatial_dims(cdims) != 3
         throw(DimensionMismatch("im2col!() only accepts 3d convoluitional inputs"))
     end
@@ -187,58 +412,50 @@ function im2col!(col::AbstractArray{T,2}, x::AbstractArray{T,4},
     dil_w, dil_h, dil_d = dilation(cdims)
     stride_w, stride_h, stride_d = stride(cdims)
     out_width, out_height, out_depth = output_size(cdims)
+    boxes = tile_boxes(rows, out_width, out_height)
 
-    # Reshape col for easy access.
-    col_reshaped = reshape(col, (
-        # Output resolution
-        out_width,
-        out_height,
-        out_depth,
-        
-        # By input patch size
-        kernel_w,
-        kernel_h,
-        kernel_d,
-        C_in,
-    ))
+    # Reshape col for easy access, by output pixel and input patch element.
+    col_reshaped = reshape(col, (size(col, 1), kernel_w, kernel_h, kernel_d, C_in))
 
     padded_regions, central_region = calc_padding_regions(cdims)
 
     # A helper function to project from output (w, h) to input (input_w, input_h)
     @inline project(idx, stride, pad) = (idx - 1)*stride - pad + 1
+    # The row of output pixel (w, h, d) in `col`
+    @inline row(w, h, d) = w + (h - 1 + (d - 1)*out_height)*out_width - first(rows) + 1
 
-    
+
     # We begin by copying the central region of the image which requires no padding at all.
     # Eliminating the branches of the fully generalized version below gives us a nice
     # speedup on the majority of the data.
-    @inbounds for c in 1:C_in
+    @inbounds for (box_w, box_h, box_d) in boxes, c in 1:C_in
         # Unpack "central region"
         w_region, h_region, d_region = central_region
 
         for kd in 1:kernel_d,
             kh in 1:kernel_h,
             kw in 1:kernel_w,
-            d in d_region,
-            h in h_region,
-            w in w_region
- 
+            d in _isect(d_region, box_d),
+            h in _isect(h_region, box_h),
+            w in _isect(w_region, box_w)
+
             input_kd = project(d, stride_d, pad_d_lo) + (kd - 1)*dil_d
             input_kh = project(h, stride_h, pad_h_lo) + (kh - 1)*dil_h
             input_kw = project(w, stride_w, pad_w_lo) + (kw - 1)*dil_w
             kidxs = kernel_index(kw, kh, kd, cdims)
 
             xval::T = x[input_kw, input_kh, input_kd, c]
-            col_reshaped[w, h, d, kidxs..., c] = xval
+            col_reshaped[row(w, h, d), kidxs..., c] = xval
         end
     end
-    
-    
+
+
     # For each "padded region", we run the fully general version
-    @inbounds for (w_region, h_region, d_region) in padded_regions
+    @inbounds for (box_w, box_h, box_d) in boxes, (w_region, h_region, d_region) in padded_regions
         for c in 1:C_in,
-            d in d_region,
-            h in h_region,
-            w in w_region,
+            d in _isect(d_region, box_d),
+            h in _isect(h_region, box_h),
+            w in _isect(w_region, box_w),
             kd in 1:kernel_d,
             kh in 1:kernel_h,
             kw in 1:kernel_w
@@ -255,23 +472,24 @@ function im2col!(col::AbstractArray{T,2}, x::AbstractArray{T,4},
                 input_kw <= 0 || input_kw > width
             )
             if out_of_bounds
-                col_reshaped[w, h, d, kidxs..., c] = T(0)
+                col_reshaped[row(w, h, d), kidxs..., c] = T(0)
                 continue
             end
 
             # Copy the data over
             xval::T = x[input_kw, input_kh, input_kd, c]
-            col_reshaped[w, h, d, kidxs..., c] = xval
+            col_reshaped[row(w, h, d), kidxs..., c] = xval
         end
-    end    
+    end
 end
 
 
 """
-    col2im!(x, col, cdims)
+    col2im!(x, col, cdims, beta=0, rows=1:M)
 
 Does the inverse of `im2col!()`, converting `col` back into a 3d image, used for backward
-passes, transposed convolutions, etc...
+passes, transposed convolutions, etc...  `x` is first scaled by `beta`, then the output
+pixels `rows`, held in the first `length(rows)` rows of `col`, are added into it.
 
 Note that this method has not been optimized in the same way as `im2col()` has, because
 it is slightly more complicated due to the more chaotic data access patterns, and I'm not
@@ -279,8 +497,8 @@ desperate enough yet.
 """
 col2im!
 
-function col2im!(x::AbstractArray{T,4}, col::AbstractArray{T,2},
-                                  cdims::ConvDims) where T
+function col2im!(x::AbstractArray{T,4}, col::AbstractArray{T,2}, cdims::ConvDims,
+                 beta::T=T(0), rows::UnitRange{Int}=1:prod(output_size(cdims))) where T
     if spatial_dims(cdims) != 3
         throw(DimensionMismatch("col2im!() only accepts 3d convoluitional inputs"))
     end
@@ -293,62 +511,60 @@ function col2im!(x::AbstractArray{T,4}, col::AbstractArray{T,2},
     dil_w, dil_h, dil_d = dilation(cdims)
     stride_w, stride_h, stride_d = stride(cdims)
     out_width, out_height, out_depth = output_size(cdims)
-    
+    boxes = tile_boxes(rows, out_width, out_height)
+
     # TODO: Rewrite this method so we don't have this fill!() at the beginning!
     # Calculate each output pixel once rather than accumulating into it?
-    fill!(x, T(0))
+    if beta == T(0)
+        fill!(x, T(0))
+    elseif beta == T(1)
+        # nothing
+    else
+        x .*= beta
+    end
 
-    # Reshape col for easy access.
-    col_reshaped = reshape(col, (
-        # Output resolution
-        out_width,
-        out_height,
-        out_depth,
-        
-        # By input patch size
-        kernel_w,
-        kernel_h,
-        kernel_d,
-        C_in,
-    ))
+    # Reshape col for easy access, by output pixel and input patch element.
+    col_reshaped = reshape(col, (size(col, 1), kernel_w, kernel_h, kernel_d, C_in))
 
     # A helper function to project from output (w, h) to input (input_w, input_h)
     @inline project(idx, stride, pad) = (idx - 1)*stride - pad + 1
+    # The row of output pixel (w, h, d) in `col`
+    @inline row(w, h, d) = w + (h - 1 + (d - 1)*out_height)*out_width - first(rows) + 1
 
-    @inbounds for c in 1:C_in
+    @inbounds for (box_w, box_h, box_d) in boxes, c in 1:C_in
         for kd in 1:kernel_d,
             kh in 1:kernel_h,
             kw in 1:kernel_w
 
-            for d in 1:out_depth
+            for d in box_d
                 input_kd = project(d, stride_d, pad_d_lo) + (kd - 1)*dil_d
-                
+
                 # If this d is off the edge, then deal with the entire plane
                 # in one fell swoop, like a ravenous flock of crows.  CAW CAW.
                 if input_kd <= 0 || input_kd > depth
                     continue
                 end
 
-                for h in 1:out_height
+                for h in box_h
                     input_kh = project(h, stride_h, pad_h_lo) + (kh - 1)*dil_h
-                    
+
                     # Same for `h`, but in this case it's only a line, not a plane.
                     # This results in slightly less caw'ing.
                     if input_kh <= 0 || input_kh > height
                         continue
                     end
-                
-                    for w in 1:out_width
+
+                    for w in box_w
                         input_kw = project(w, stride_w, pad_w_lo) + (kw - 1)*dil_w
-                
+
                         # If this `w` is off the edge, only it gets cleared out.
                         if input_kw <= 0 || input_kw > width
                             continue
                         end
-                        
+
                         # Copy the data over
                         kidxs = kernel_index(kw, kh, kd, cdims)
-                        cval::T = col_reshaped[w, h, d, kidxs..., c]
+                        cval::T = col_reshaped[row(w, h, d), kidxs..., c]
                         x[input_kw, input_kh, input_kd, c] += cval
                     end
                 end

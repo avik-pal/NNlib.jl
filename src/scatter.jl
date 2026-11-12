@@ -14,14 +14,14 @@ typelength(::Type{<:NTuple{M}}) where M = M
 typelength(::Type{CartesianIndex{M}}) where M = M
 
 """
-Performs dimensional consistency checks and return the 
+Performs dimensional consistency checks and return the
 dimensionality of the scattered objects.
 """
-function scatter_dims(X::AbstractArray{Tx,Nx}, 
-                     Y::AbstractArray{Ty,Ny},
-                     idx::AbstractArray{Tidx,Nidx}) where {Tx,Ty,Tidx,Nx,Ny,Nidx}
-    M = typelength(Tidx)
-    dims = scatter_dims(Nx, Ny, M, Nidx)
+function scatter_dims(
+    X::AbstractArray{Tx,Nx}, Y::AbstractArray{Ty,Ny},
+    idx::AbstractArray{Tidx,Nidx},
+) where {Tx,Ty,Tidx,Nx,Ny,Nidx}
+    dims = scatter_dims(Nx, Ny, typelength(Tidx), Nidx)
     size(X)[1:dims] == size(Y)[1:dims] || throw(ArgumentError("Incompatible input shapes."))
     size(Y)[dims+1:end] == size(idx) || throw(ArgumentError("Incompatible input shapes."))
     return dims
@@ -37,11 +37,41 @@ end
 _view(X, colons, k) = view(X, colons..., k...)
 _view(X, colons, k::Union{Integer, CartesianIndex}) = view(X, colons..., k)
 
+# Move `idx` onto the same backend as the GPU array `ref`, so that `gather`/`scatter`
+# work when the source/destination is on the GPU but the index was left on the CPU.
+# Returns `idx` unchanged when it already lives on a GPU (issue #415).
+_to_backend(ref::AnyGPUArray, idx::AnyGPUArray) = idx
+function _to_backend(ref::AnyGPUArray, idx::AbstractArray)
+    idx_dev = similar(ref, eltype(idx), size(idx))
+    # an `Array` first: a range has no bulk copy to the GPU
+    return copyto!(idx_dev, convert(Array, idx))
+end
+
+# Check that every entry of `idx` is within the `sz` trailing dimensions it indexes
+# into. The CPU `gather!`/`scatter!` get this for free from `view`, but the GPU
+# kernels use `@inbounds`, so an out-of-range index would otherwise silently corrupt
+# memory instead of erroring (issue #416). Runs on the CPU or the GPU (one reduction).
+function checkbounds_idx(idx::AbstractArray, sz::Dims)
+    isempty(idx) || all(k -> _idx_inbounds(k, sz), idx) || throw(ArgumentError(
+        "out-of-bounds index in `idx`: every index must address the trailing size $sz"))
+    return nothing
+end
+
+@inline _idx_inbounds(k::Integer, sz::Dims{1}) = 1 ≤ k ≤ sz[1]
+@inline _idx_inbounds(k::CartesianIndex, sz::Dims) = _idx_inbounds(Tuple(k), sz)
+@inline function _idx_inbounds(k::NTuple{M,<:Integer}, sz::Dims{M}) where M
+    inbounds = true
+    for d in 1:M
+        inbounds &= 1 ≤ k[d] ≤ sz[d]
+    end
+    return inbounds
+end
+
 """
-    NNlib.scatter!(op, dst, src, idx)
+    NNlib.scatter!(op, dst, src, idx; checkbounds = true)
 
 Scatter operation, which writes data in `src` into `dst` at locations `idx`.
-A binary reduction operator `op` is applied during the scatter. 
+A binary reduction operator `op` is applied during the scatter.
 For each index `k` in `idx`, accumulates values in `dst` according to
 
     dst[:, ..., idx[k]...] = (op).(dst[:, ..., idx[k]...], src[:, ..., k...])
@@ -53,8 +83,12 @@ See also [`scatter`](@ref), [`gather`](@ref).
 - `op`: Operations to be applied on `dst` and `src`, e.g. `+`, `-`, `*`, `/`, `max`, `min` and `mean`.
 - `dst`: The destination for `src` to aggregate to. This argument will be mutated.
 - `src`: The source data for aggregating.
-- `idx`: The mapping for aggregation from source (index) to destination (value). 
+- `idx`: The mapping for aggregation from source (index) to destination (value).
          The `idx` array can contain either integers or tuples.
+- `checkbounds`: On a GPU, checking that the indices are in range synchronizes the host
+         with the device. A caller that has checked them already can skip that with
+         `checkbounds = false`: an index out of range then gives an undefined result,
+         and may corrupt memory.
 
 # Examples
 ```jldoctest
@@ -70,7 +104,8 @@ julia> NNlib.scatter!(*, fill(0.5, 2, 4), [1 10; 100 1000], [3,2])
  0.5  500.0  50.0  0.5
 ```
 """
-function scatter!(op, dst::AbstractArray, src::AbstractArray, idx::AbstractArray)
+function scatter!(op::OP, dst::AbstractArray, src::AbstractArray, idx::AbstractArray;
+                  checkbounds::Bool = true) where OP
     dims = scatter_dims(dst, src, idx)
     colons = Base.ntuple(_->Colon(), dims)
     for k in CartesianIndices(idx)
@@ -81,26 +116,91 @@ function scatter!(op, dst::AbstractArray, src::AbstractArray, idx::AbstractArray
     dst
 end
 
-function scatter!(op::typeof(mean), dst::AbstractArray, src::AbstractArray, idx::AbstractArray)
-    Ns = scatter!(+, zero(dst), one.(src), idx)
-    dst_ = scatter!(+, zero(dst), src, idx)
-    dst .+= safe_div.(dst_, Ns)
-    return dst
+for AT in (AbstractArray, AnyGPUArray)
+    @eval function scatter!(op::typeof(mean), dst::$AT, src::$AT, idx::$AT; checkbounds::Bool = true)
+        Ns = scatter!(+, zero(dst), one.(src), idx; checkbounds)
+        dst_ = scatter!(+, zero(dst), src, idx; checkbounds = false)
+        dst .+= safe_div.(dst_, Ns)
+        return dst
+    end
 end
 
+function scatter!(op::OP, dst::AnyGPUArray, src::AnyGPUArray, idx::AnyGPUArray;
+                  checkbounds::Bool = true) where OP
+    n_dims = scatter_dims(dst, src, idx)
+    checkbounds && checkbounds_idx(idx, size(dst)[n_dims+1:end])
+    args = if n_dims == 0
+        ndrange = length(idx)
+        ()
+    else
+        dims = size(dst)[1:n_dims]
+        max_dims_idx = prod(dims)
+        ndrange = max_dims_idx * length(idx)
+        (CartesianIndices(dims), max_dims_idx)
+    end
+    _scatter!(KernelAbstractions.get_backend(dst))(
+        op, dst, src, idx, args...; ndrange)
+    dst
+end
+
+# Destination on the GPU, index on the CPU: move the index to the GPU and dispatch to
+# the kernel above, rather than falling back to slow scalar indexing (issue #415). The
+# index is checked before the copy, on the CPU, where the check does not wait for the
+# GPU. The `mean` method resolves dispatch ambiguity with the `op::typeof(mean)` methods above.
+scatter!(op::OP, dst::AnyGPUArray, src::AnyGPUArray, idx::AbstractArray;
+         checkbounds::Bool = true) where OP = _scatter_cpu_idx!(op, dst, src, idx, checkbounds)
+scatter!(op::typeof(mean), dst::AnyGPUArray, src::AnyGPUArray, idx::AbstractArray;
+         checkbounds::Bool = true) = _scatter_cpu_idx!(op, dst, src, idx, checkbounds)
+
+function _scatter_cpu_idx!(op::OP, dst, src, idx, checkbounds) where OP
+    checkbounds && checkbounds_idx(idx, size(dst)[scatter_dims(dst, src, idx)+1:end])
+    return scatter!(op, dst, src, _to_backend(dst, idx); checkbounds = false)
+end
+
+@kernel function _scatter!(op::OP, dst, src, idxs) where OP
+    i = @index(Global)
+    @inbounds idx = Tuple(_convert_i64(idxs[i]))
+    @inbounds _atomic_scatter!(dst, idx, op, src[i])
+end
+
+@kernel function _scatter!(
+    op::OP, dst, src, idxs, dim_ids::CartesianIndices, max_dims_idx::Int,
+) where OP
+    i = @index(Global)
+    j, k = divrem(i - 1, max_dims_idx)
+    @inbounds idx = (Tuple(dim_ids[k + 1])..., Tuple(_convert_i64(idxs[j + 1]))...)
+    @inbounds _atomic_scatter!(dst, idx, op, src[i])
+end
+
+# Atomically perform `dst[idx...] = op(dst[idx...], val)` inside a scatter kernel.
+# The default routes through Atomix, which covers the full op set on CUDA and
+# AMDGPU. Metal is special-cased in NNlibMetalExt because Atomix's Metal atomics
+# only support a subset of ops (e.g. they error on float `max`/`min` and silently
+# no-op on `*`/`/`); see https://github.com/FluxML/NNlib.jl/issues/534.
+# NNlibCUDAExt adds 16-bit floats in pairs (#854). Also used by `∇upsample_linear`.
+@inline _atomic_scatter!(dst, idx, op::OP, val) where OP =
+    Atomix.modify!(Atomix.IndexableRef(dst, idx), op, val)
+
+# Allow non-Int64 indices by converting them to Int64 when index eltype <: Integer.
+# All other index types (tuples, cartesian indices) must be in Int64 already.
+@inline _convert_i64(x::Int) = x
+@inline _convert_i64(x::Integer) = Int(x)
+@inline _convert_i64(x) = x
 
 """
-    NNlib.scatter(op, src, idx; [init, dstsize])
+    NNlib.scatter(op, src, idx; [init, dstsize, checkbounds])
 
-Scatter operation allocating a destination array `dst` and 
+Scatter operation allocating a destination array `dst` and
 calling `scatter!(op, dst, src, idx)` on it.
 
 * If keyword `init` is provided, it is used to initialize the content of `dst`.
   Otherwise, the init values is inferred from the reduction operator `op`
-  for some common operators (e.g. `init = 0` for `op = +`). 
+  for some common operators (e.g. `init = 0` for `op = +`).
 
 * If `dstsize` is provided, it will be used to define the size of
   destination array, otherwise it will be inferred by `src` and `idx`.
+
+* `checkbounds = false` skips the check of the indices on a GPU, see [`scatter!`](@ref).
 
 See [`scatter!`](@ref) for full details on how `idx` works.
 
@@ -127,17 +227,17 @@ julia> NNlib.scatter(*, [10,200,3000], [1,4,2]; init = 10, dstsize = 6)
     10
 ```
 """
-function scatter(op,
-                src::AbstractArray{Tsrc,Nsrc},
-                idx::AbstractArray{Tidx,Nidx};
-                init = nothing, dstsize = nothing) where {Tsrc,Tidx,Nsrc,Nidx}
-    
+function scatter(
+    op::OP, src::AbstractArray{Tsrc,Nsrc}, idx::AbstractArray{Tidx,Nidx};
+    init = nothing, dstsize = nothing, checkbounds::Bool = true,
+) where {Tsrc,Tidx,Nsrc,Nidx,OP}
     dims = Nsrc - Nidx
-    dstsz = isnothing(dstsize) ? (size(src)[1:dims]..., maximum_dims(idx)...) : dstsize 
+    dstsz = isnothing(dstsize) ? (size(src)[1:dims]..., maximum_dims(idx)...) : dstsize
     dst = similar(src, Tsrc, dstsz)
-    xinit = isnothing(init) ? scatter_empty(op, Tsrc) : init 
+    xinit = isnothing(init) ? scatter_empty(op, Tsrc) : init
     fill!(dst, xinit)
-    scatter!(op, dst, src, idx)
+    # no keyword by default, for the methods of other packages that take none (Reactant's)
+    checkbounds ? scatter!(op, dst, src, idx) : scatter!(op, dst, src, idx; checkbounds)
 end
 
 scatter_empty(op, T) = Base.reduce_empty(op, T)
@@ -147,52 +247,78 @@ scatter_empty(op::typeof(min), T) = typemax(T)
 scatter_empty(op::typeof(max), T) = typemin(T)
 scatter_empty(op::typeof(mean), T) = zero(T)
 
-
 ## Gradients
 
-∇scatter!_src(op, Δ, dst, src, idx) = ∇scatter_src(op, Δ, dst, src, idx) 
-∇scatter!_dst(op, Δ, dst, y) = Δ
-
-∇scatter!_dst(op::Union{typeof(max),typeof(min)}, Δ, dst_old, dst) = 
+# `dst_old` and `dst` are the destination before and after `scatter!`. The pullbacks
+# reuse the indices that the forward pass checked.
+∇scatter!_src(op, Δ, dst_old, dst, src, idx) = ∇scatter_src(op, Δ, dst, src, idx)
+∇scatter!_src(op::Union{typeof(*),typeof(/)}, Δ, dst_old, dst, src, idx) =
+    gather(dst_old, idx; checkbounds = false) .* ∇scatter_src(op, Δ, dst, src, idx)
+∇scatter!_dst(op, Δ, dst_old, dst, src, idx) = Δ
+∇scatter!_dst(op::Union{typeof(max),typeof(min)}, Δ, dst_old, dst, src, idx) =
     (dst_old .== op.(dst_old, dst)) .* Δ
+# dst_new = dst_old * P (or dst_old / P), with P the product of the sources scattered to each entry
+∇scatter!_dst(::typeof(*), Δ, dst_old, dst, src, idx) =
+    Δ .* scatter(*, src, idx; dstsize = size(dst), checkbounds = false)
+∇scatter!_dst(::typeof(/), Δ, dst_old, dst, src, idx) =
+    Δ ./ scatter(*, src, idx; dstsize = size(dst), checkbounds = false)
 
 modify_src(::typeof(+), X) = X
 modify_src(::typeof(-), X) = -X
 modify_src(::typeof(*), X, Y) = X
 modify_src(::typeof(/), X, Y) = .-X ./ Y.^2
 
-∇scatter_src(op::Union{typeof(+),typeof(-)}, Δ, dst, src, idx) = modify_src(op, gather(Δ, idx))
+∇scatter_src(op::Union{typeof(+),typeof(-)}, Δ, dst, src, idx) =
+    modify_src(op, gather(Δ, idx; checkbounds = false))
+∇scatter_src(::Union{typeof(max),typeof(min)}, Δ, dst, src, idx) =
+    (src .== gather(dst, idx; checkbounds = false)) .* gather(Δ, idx; checkbounds = false)
 
-∇scatter!_src(op::Union{typeof(*),typeof(/)}, Δ, dst, src, idx) = 
-    gather(dst, idx) .* ∇scatter_src(op, Δ, dst, src, idx)
-
-function ∇scatter_src(op::Union{typeof(*),typeof(/)}, Δ, dst,
-                      src::AbstractArray{Tsrc,Nsrc}, 
-                      idx::AbstractArray{Tidx,Nidx}) where {Tsrc,Tidx,Nsrc,Nidx}
+function ∇scatter_src(
+    op::Union{typeof(*),typeof(/)}, Δ, dst,
+    src::AbstractArray{Tsrc,Nsrc}, idx::AbstractArray{Tidx,Nidx},
+) where {Tsrc,Tidx,Nsrc,Nidx}
     dims = Nsrc - Nidx
-    Δsrc = modify_src(op, gather(Δ, idx), src)
+    Δsrc = modify_src(op, gather(Δ, idx; checkbounds = false), src)
     rev_idx = reverse_indices(idx)
     ax = CartesianIndices(axes(src)[1:dims])
     for k in CartesianIndices(idx)
         inds = filter(x -> x != k, rev_idx[idx[k]])
         for i in ax
-            Δsrc[i, k] = op(Δsrc[i, k], prod(j -> src[i, j], inds))
+            # `init` handles values mapped by a single source position, where
+            # `inds` is empty and the product of siblings is the identity.
+            Δsrc[i, k] = op(Δsrc[i, k], prod(j -> src[i, j], inds; init=one(Tsrc)))
         end
     end
     Δsrc
 end
 
-∇scatter_src(::Union{typeof(max),typeof(min)}, Δ, dst, src, idx) = (src .== gather(dst, idx)) .* gather(Δ, idx)
+# The product-rule gradient needs, for each source position, the product of its
+# "siblings" (the other source values scattering to the same destination). That
+# equals the product over the whole group divided by the element itself, and the
+# group product is just a forward `*`-scatter. Expressing it with
+# `gather`/`scatter`/broadcast keeps everything on the device and avoids the
+# ragged reverse-index buffer, which cannot be compiled on backends such as Metal.
+function ∇scatter_src(
+    op::Union{typeof(*), typeof(/)}, Δ, dst,
+    src::AnyGPUArray{Tsrc, Nsrc}, idx::AnyGPUArray{Tidx, Nidx},
+) where {Tsrc, Nsrc, Tidx, Nidx}
+    Δsrc = NNlib.modify_src(op, NNlib.gather(Δ, idx; checkbounds = false), src)
+    group_prod = NNlib.scatter(*, src, idx; dstsize = size(Δ), checkbounds = false)
+    prod_siblings = NNlib.gather(group_prod, idx; checkbounds = false) ./ src
+    return op.(Δsrc, prod_siblings)
+end
 
-function ∇scatter_src(::typeof(mean), Δ, dst,
-                    src::AbstractArray{Tsrc,Nsrc}, 
-                    idx::AbstractArray{Tidx,Nidx}) where {Tsrc,Tidx,Nsrc,Nidx}
-    
+function ∇scatter_src(
+    ::typeof(mean), Δ, dst,
+    src::AbstractArray{Tsrc,Nsrc}, idx::AbstractArray{Tidx,Nidx},
+) where {Tsrc,Tidx,Nsrc,Nidx}
     M = typelength(Tidx)
-    num = gather(Δ, idx)
-    counts = fill!(similar(Δ, Int, size(Δ)[end-M+1:end]), 0)
-    scatter!(+, counts, fill!(similar(idx, Int), 1), idx)
-    den = gather(counts, idx)
+    num = gather(Δ, idx; checkbounds = false)
+    # `Int32` (rather than `Int`) keeps the count buffer compatible with backends
+    # that lack 64-bit atomics, e.g. Metal. Counts are small, so this never overflows.
+    counts = fill!(similar(Δ, Int32, size(Δ)[end-M+1:end]), 0)
+    scatter!(+, counts, fill!(similar(idx, Int32), 1), idx; checkbounds = false)
+    den = gather(counts, idx; checkbounds = false)
     # make num and den broadcast compatible
     for i in 1:ndims(num)-ndims(den)
         den = unsqueeze(den)
@@ -200,18 +326,26 @@ function ∇scatter_src(::typeof(mean), Δ, dst,
     return safe_div.(num, den)
 end
 
-∇scatter_src(op, Δ, dst, src, idx) =
-  ∇scatter_src(op, unthunk(Δ), dst, src, idx)
+∇scatter_src(op, Δ, dst, src, idx) = ∇scatter_src(op, unthunk(Δ), dst, src, idx)
 
-function rrule(::typeof(scatter!), op, dst::AbstractArray, src::AbstractArray, idx::AbstractArray)
+function rrule(::typeof(scatter!), op, dst::AbstractArray, src::AbstractArray, idx::AbstractArray;
+               checkbounds::Bool = true)
     dst_old = copy(dst)
-    scatter!(op, dst, src, idx)
-    scatter!_pullback(Δ) = (NoTangent(), NoTangent(), ∇scatter!_dst(op, unthunk(Δ), dst_old, dst), ∇scatter!_src(op, unthunk(Δ), dst, src, idx), NoTangent())
+    scatter!(op, dst, src, idx; checkbounds)
+    function scatter!_pullback(Δ)
+        Δ = unthunk(Δ)
+        return (NoTangent(), NoTangent(), ∇scatter!_dst(op, Δ, dst_old, dst, src, idx),
+                ∇scatter!_src(op, Δ, dst_old, dst, src, idx), NoTangent())
+    end
     dst, scatter!_pullback
 end
 
-function rrule(::typeof(scatter), op, src::AbstractArray, idx::AbstractArray; kws...)
-    y = scatter(op, src, idx; kws...)
-    scatter_pullback(Δ) = (NoTangent(), NoTangent(), ∇scatter_src(op, unthunk(Δ), y, src, idx), NoTangent())
+# the result of `*` and `/` is `init` times (or over) the product of the sources
+scale_init(op, init, Δsrc) = Δsrc
+scale_init(::Union{typeof(*),typeof(/)}, init::Number, Δsrc) = convert(eltype(Δsrc), init) .* Δsrc
+
+function rrule(::typeof(scatter), op, src::AbstractArray, idx::AbstractArray; init = nothing, kws...)
+    y = scatter(op, src, idx; init, kws...)
+    scatter_pullback(Δ) = (NoTangent(), NoTangent(), scale_init(op, init, ∇scatter_src(op, unthunk(Δ), y, src, idx)), NoTangent())
     y, scatter_pullback
 end

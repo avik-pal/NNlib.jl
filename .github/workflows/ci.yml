@@ -9,97 +9,115 @@ on:
     tags: '*'
   pull_request:
 
+concurrency:
+  # Cancel any in-progress run when a new commit is pushed to the same PR/branch,
+  # to save CI resources on frequent pushes. Runs on `master` are never cancelled.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+# needed to allow julia-actions/cache to delete old caches that it has created
+permissions:
+  actions: write
+  contents: read
+
 defaults:
   run:
     shell: bash
 
 jobs:
   test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.julia-threads }} thread(s) - ${{ github.event_name }} 
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    env:
-      JULIA_NUM_THREADS: ${{ matrix.julia-threads }}
+    # The test environment depends on packages tied to compiler internals (Enzyme,
+    # Mooncake), which routinely fail to precompile on Julia nightly. Keep the job
+    # for information, but don't let it fail the workflow.
+    continue-on-error: ${{ matrix.version == 'nightly' }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         version:
+          - '1.10' # uncomment when julia 1.10 is out
           - '1'   # automatically expands to the latest stable 1.x release of Julia
           - 'nightly'
         os:
           - ubuntu-latest
           # - macOS-latest
           # - windows-latest
-        arch:
-          - x64
-        julia-threads:
-          - '1'
 
         include:
           - os: windows-latest
             version: '1'
-            arch: x64
-            julia-threads: '1'
           - os: macOS-latest
             version: '1'
-            arch: x64
-            julia-threads: '1'
-          - os: ubuntu-latest
-            version: '1'
-            arch: x64
-            julia-threads: '2'
-  
+
     steps:
-      - uses: actions/checkout@v2
-      - uses: julia-actions/setup-julia@v1
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
-          arch: ${{ matrix.arch }}
-      - uses: actions/cache@v1
-        env:
-          cache-name: cache-artifacts
-        with:
-          path: ~/.julia/artifacts
-          key: ${{ runner.os }}-test-${{ env.cache-name }}-${{ hashFiles('**/Project.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-test-${{ env.cache-name }}-
-            ${{ runner.os }}-test-
-            ${{ runner.os }}-
+      - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
-      - uses: julia-actions/julia-runtest@v1
+
+      # Enzyme compiles slowly and is tested on Linux.
+      - if: runner.os != 'Linux'
+        run: echo "NNLIB_TEST_ENZYME=false" >> "$GITHUB_ENV"
+      # With 7 GB of memory, two test workers swap.
+      - if: runner.os == 'macOS'
+        run: echo "PTR_NUM_JOBS=1" >> "$GITHUB_ENV"
+
+      - name: "Run test without coverage"
+        uses: julia-actions/julia-runtest@v1
+        if: ${{ !contains(fromJson('["1"]'), matrix.version) || matrix.os != 'ubuntu-latest' }}
+        with:
+          coverage: false
+
+      - name: "Run test with coverage"
+        uses: julia-actions/julia-runtest@v1
+        if: contains(fromJson('["1"]'), matrix.version) && matrix.os == 'ubuntu-latest'
       - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v1
+        if: contains(fromJson('["1"]'), matrix.version) && matrix.os == 'ubuntu-latest'
+      - uses: codecov/codecov-action@v7
+        if: contains(fromJson('["1"]'), matrix.version) && matrix.os == 'ubuntu-latest'
         with:
           file: lcov.info
 
-  # docs:
-  #   name: Documentation
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v2
-  #     - uses: julia-actions/setup-julia@v1
-  #       with:
-  #         version: '1'
-  #     - run: julia --project=docs .ci/develop.jl
-  #     - run: julia --project=docs docs/make.jl
-  #       env:
-  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  #         DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
-  
-  # doctests:
-  #   name: Doctests
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v2
-  #     - uses: julia-actions/setup-julia@v1
-  #       with:
-  #         version: '1'
-  #     - run: julia --project=docs .ci/develop.jl
-  #     - run: |
-  #         julia --project=docs -e '
-  #           using Documenter
-  #           using NNlib
-  #           # using NNlibCUDA
-  #           DocMeta.setdocmeta!(NNlib, :DocTestSetup, :(using NNlib); recursive=true)
-  #           # DocMeta.setdocmeta!(NNlibCUDA, :DocTestSetup, :(using NNlib, CUDA); recursive=true)
-  #           doctest(NNlib)
-  #           # doctest(NNlibCUDA)'
+  test-threaded:
+    name: Julia 1 - ubuntu-latest - 2 threads
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      NNLIB_TEST_THREADED: 'true'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v3
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: false
+
+  test-reactant:
+    name: Julia 1 - ubuntu-latest - Reactant
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      NNLIB_TEST_REACTANT: 'true'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v3
+      # Reactant is heavy, so only this job adds it to test/Project.toml [deps], then updates
+      # the shared [workspace] manifest (as the Buildkite GPU jobs do).
+      - run: |
+          echo 'Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"' >> test/Project.toml
+          julia --project=. -e 'using Pkg; Pkg.update()'
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: false
+          test_args: 'reactant'

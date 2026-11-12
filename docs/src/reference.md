@@ -1,0 +1,225 @@
+# Reference
+
+The API reference of `NNlib`.
+
+## Activation Functions
+
+Non-linearities that go between layers of your model. Note that, unless otherwise stated, activation functions operate on scalars. To apply them to an array you can call `σ.(xs)`, `relu.(xs)` and so on.
+
+For `Float16` and `BFloat16` inputs, the activations that involve arithmetic are computed in `Float32` and the result is rounded back to the input type, as PyTorch does. This is faster and more accurate than half precision arithmetic.
+
+```@docs
+celu
+elu
+gelu
+gelu_tanh
+gelu_sigmoid
+gelu_erf
+quick_gelu
+hardsigmoid
+sigmoid_fast
+hardtanh
+tanh_fast
+leakyrelu
+lisht
+logcosh
+logsigmoid
+mish
+relu
+relu6
+rrelu
+selu
+sigmoid
+softplus
+softshrink
+softsign
+swish
+hardswish
+tanhshrink
+trelu
+```
+
+## Attention 
+
+```@docs
+scaled_dot_product_attention
+scaled_dot_product_attention_with_weights
+make_causal_mask
+NNlib.is_fused_attention
+```
+
+### Rotary position embedding
+
+```@docs
+NNlib.rotary_embedding_table
+NNlib.apply_rotary_embedding
+```
+
+## State-space and linear-attention layers
+
+The sequence mixing of the layers that carry a state along the sequence, as Mamba-2 and
+Gated DeltaNet, in the layout of the attention. Each takes the state of a previous part of
+the sequences and returns the state after its last token, for decoding one token at a time.
+
+```@docs
+NNlib.causal_conv1d
+NNlib.ssd_scan
+NNlib.gated_delta_rule
+```
+
+## Softmax
+
+`Flux`'s `logitcrossentropy` uses `NNlib.logsoftmax` internally.
+
+```@docs
+softmax
+softmax!
+∇softmax
+∇softmax!
+logsoftmax
+logsoftmax!
+∇logsoftmax
+∇logsoftmax!
+```
+
+## Pooling
+
+`Flux`'s `AdaptiveMaxPool`, `AdaptiveMeanPool`, `GlobalMaxPool`, `GlobalMeanPool`, `MaxPool`, `MeanPool` and `lpnormpool` use `NNlib.PoolDims`, `NNlib.maxpool`, `NNlib.meanpool` and `NNlib.lpnormpool` as their backend.
+
+`NNlib.meanpool` supports complex inputs (the real and imaginary parts are pooled independently). This is handled in the generic code, so it works on every backend that pools real arrays — CPU, CUDA and AMDGPU. `maxpool` does not support complex inputs, since `max` is undefined for complex numbers.
+
+```@docs
+PoolDims
+maxpool
+meanpool
+lpnormpool
+```
+
+## Padding
+
+```@docs
+pad_reflect
+pad_symmetric
+pad_circular
+pad_repeat
+pad_constant
+pad_zeros
+```
+
+## Convolution
+
+`Flux`'s `Conv` and `CrossCor` layers use `NNlib.DenseConvDims` and `NNlib.conv` internally.
+
+`NNlib.conv` supports complex datatypes on CPU and CUDA devices.
+
+!!! note "AMDGPU MIOpen supports only cross-correlation (flipped=true)."
+
+    Therefore, for every regular convolution (`flipped=false`), the kernel is flipped before
+    calculation.
+    For better performance, use cross-correlation (`flipped=true`) and manually flip the
+    kernel before the `NNlib.conv` call.
+    `Flux` handles this automatically; this is only required for direct calls.
+
+```@docs
+conv
+ConvDims
+depthwiseconv
+DepthwiseConvDims
+DenseConvDims
+NNlib.unfold
+NNlib.fold
+```
+
+## Upsampling
+
+`Flux`'s `Upsample` layer uses `NNlib.upsample_nearest`, `NNlib.upsample_bilinear`, and `NNlib.upsample_trilinear` as its backend. Additionally, `Flux`'s `PixelShuffle` layer uses `NNlib.pixel_shuffle` as its backend.
+
+```@docs
+upsample_nearest
+∇upsample_nearest
+upsample_linear
+∇upsample_linear
+upsample_bilinear
+∇upsample_bilinear
+upsample_bicubic
+∇upsample_bicubic
+upsample_trilinear
+∇upsample_trilinear
+pixel_shuffle
+```
+
+## Rotation
+Rotate images in the first two dimensions of an array.
+
+```@docs
+imrotate
+∇imrotate
+```
+
+## Batched Operations
+
+`Flux`'s `Bilinear` layer uses `NNlib.batched_mul` internally.
+
+```@docs
+batched_mul
+batched_mul!
+batched_adjoint
+batched_transpose
+batched_vec
+grouped_mul
+grouped_mul!
+```
+
+## Gather and Scatter
+
+`Flux`'s `Embedding` layer uses `NNlib.gather` as its backend.
+
+```@docs
+NNlib.gather
+NNlib.gather!
+NNlib.scatter
+NNlib.scatter!
+```
+
+## Sampling
+
+```@docs
+grid_sample
+∇grid_sample
+```
+
+## Normalization
+
+`Flux`'s `BatchNorm`, `InstanceNorm`, `GroupNorm` and `LayerNorm` layers can use
+`NNlib.batchnorm`, `NNlib.instancenorm`, `NNlib.groupnorm` and `NNlib.layernorm`
+as their functional backend.
+
+```@docs
+NNlib.normalise
+NNlib.batchnorm
+NNlib.instancenorm
+NNlib.groupnorm
+NNlib.layernorm
+NNlib.rmsnorm
+NNlib.∇batchnorm
+NNlib.∇instancenorm
+NNlib.∇groupnorm
+NNlib.∇layernorm
+NNlib.∇rmsnorm
+```
+
+## Losses
+
+```@docs
+ctc_loss
+```
+
+## Miscellaneous
+
+```@docs
+logsumexp
+NNlib.glu
+NNlib.swiglu
+NNlib.within_gradient
+bias_act!
+```

@@ -1,11 +1,3 @@
-
-export batched_mul, batched_mul!, ⊠,  batched_vec
-export batched_transpose, batched_adjoint
-
-include("./batchedadjtrans.jl")
-
-using LinearAlgebra: BlasFloat, Transpose, Adjoint, AdjOrTransAbsMat
-
 _unbatch(A) = A
 _unbatch(A::BatchedAdjOrTrans) = parent(A)
 
@@ -13,8 +5,10 @@ _unbatch(A::BatchedAdjOrTrans) = parent(A)
     batched_mul(A, B) -> C
     A ⊠ B  # \\boxtimes
 
-Batched matrix multiplication. Result has `C[:,:,k] == A[:,:,k] * B[:,:,k]` for all `k`.
-If `size(B,3) == 1` then instead `C[:,:,k] == A[:,:,k] * B[:,:,1]`, and similarly for `A`.
+Batched matrix multiplication. Result has `C[:,:,k...] == A[:,:,k...] * B[:,:,k...]` where `k...` represent 
+any indices in the last dimensions.
+
+If `ndims(A) == ndims(B) == 3` and `size(B,3) == 1` then instead `C[:,:,k] == A[:,:,k] * B[:,:,1]`, and similarly for `A`.
 
 To transpose each matrix, apply `batched_transpose` to the array,
 or `batched_adjoint` for conjugate-transpose:
@@ -50,6 +44,15 @@ This will be copied, as doing so is faster than `batched_mul_generic!`.
 Both this `copy` and `batched_mul_generic!` produce `@debug` messages,
 and setting for instance `ENV["JULIA_DEBUG"] = NNlib` will display them.
 """
+function batched_mul(x::AbstractArray{T1,N}, y::AbstractArray{T2,N}) where {T1,T2,N}
+    batch_size = size(x)[3:end]
+    @assert batch_size == size(y)[3:end] "batch size has to be the same for the two arrays."
+    x2 = reshape(x, size(x, 1), size(x, 2), :)
+    y2 = reshape(y, size(y, 1), size(y, 2), :)
+    z = batched_mul(x2, y2)
+    return reshape(z, size(z, 1), size(z, 2), batch_size...)
+  end
+
 function batched_mul(A::AbstractArray{T1, 3}, B::AbstractArray{T2, 3}) where {T1, T2}
     size(A, 3) == size(B, 3) || size(A, 3) == 1 || size(B, 3) == 1 ||
         throw(DimensionMismatch("batch size mismatch: A != B"))
@@ -159,12 +162,17 @@ _semi_batched_mul(A::Transpose{<:Number,<:AbstractMatrix}, B::AbstractArray{<:An
     batched_mul(batched_transpose(reshape(parent(A), size(parent(A))..., 1)), B)
 
 """
-    batched_vec(A::Array{T,3}, B::Matrix)
-    batched_vec(A::Array{T,3}, b::Vector)
+    batched_vec(A::AbstractArray{T,3}, B::AbstractMatrix)
+    batched_vec(A::AbstractArray{T,3}, b::AbstractVector)
+    batched_vec(A::AbstractArray, B::AbstractArray)
 
-Batched matrix-vector multiplication:
+Batched matrix-vector multiplication. For the 3D case:
 the result has `C[:,:,k] == A[:,:,k] * B[:,k]` for all `k`,
 or else `C[:,:,k] == A[:,:,k] * b` for `b::Vector`.
+
+For the general N-D case where `ndims(A) == ndims(B) + 1`:
+the result has `C[:,k...] == A[:,:,k...] * B[:,k...]` for all batch indices `k...`.
+The batch dimensions must match: `size(A)[3:end] == size(B)[2:end]`.
 
 With the same argument types, `batched_mul(A, B)` would regard `B` as
 a fixed matrix, not a batch of vectors. Both reshape and then
@@ -178,15 +186,33 @@ julia> batched_vec(A,B) |> size
 
 julia> batched_vec(A,b) |> size
 (16, 32)
+
+julia> A4d, B3d = randn(16,8,10,32), randn(8,10,32);  # 4D and 3D arrays
+
+julia> batched_vec(A4d, B3d) |> size
+(16, 10, 32)
 ```
 """
-function batched_vec(A::AbstractArray{T,3} where T, B::AbstractMatrix)
-    # If B is transposed, then stride=1 is the batch dim, so we will end up copying anyway:
-    if B isa AdjOrTransAbsMat{<:BlasFloat, <:StridedMatrix}
-        return batched_vec(A, copy(B))
-    end
-    reshape(batched_mul(A, reshape(B, size(B,1), 1, size(B,2))), size(A,1), size(A,3))
+function batched_vec(A::AbstractArray, B::AbstractArray)
+    ndims(A) == ndims(B) + 1 || throw(DimensionMismatch(
+        "batched_vec requires ndims(A) == ndims(B) + 1, got ndims(A)=$(ndims(A)) and ndims(B)=$(ndims(B))"))
+    size(A)[3:end] == size(B)[2:end] || throw(DimensionMismatch(
+        "batch dimensions must match: size(A)[3:end]=$(size(A)[3:end]) != size(B)[2:end]=$(size(B)[2:end])"))
+    
+    # Reshape B to add a singleton dimension for matrix multiplication
+    B_reshaped = reshape(B, size(B, 1), 1, size(B)[2:end]...)
+    # Perform batched multiplication
+    C = batched_mul(A, B_reshaped)
+    # Remove the singleton dimension
+    return dropdims(C, dims=2)
 end
+
+batched_vec(A::AbstractArray{T,3} where T, B::AbstractMatrix) =
+    reshape(batched_mul(A, reshape(B, size(B,1), 1, size(B,2))), size(A,1), size(A,3))
+
+# If B is transposed, then stride=1 is the batch dim, so we will end up copying anyway:
+batched_vec(A::AbstractArray{T,3} where T, B::AdjOrTransAbsMat{<:BlasFloat, <:StridedMatrix}) =
+    batched_vec(A, copy(B))
 
 batched_vec(A::AbstractArray{T,3} where T, b::AbstractVector) =
     reshape(batched_mul(A, reshape(b, length(b), 1, 1)), size(A,1), size(A,3))
@@ -201,7 +227,7 @@ In-place batched matrix multiplication, equivalent to
 If `size(B,3) == 1` then every batch uses `B[:,:,1]` instead.
 
 This will call `batched_gemm!` whenever possible. For real arrays this means that,
-for `X ∈ [A,B,C]`, either `strides(X,1)==1` or `strides(X,2)==1`, the latter may
+for `X ∈ [A,B,C]`, either `stride(X,1)==1` or `stride(X,2)==1`, the latter may
 be caused by `batched_transpose` or by for instance `PermutedDimsArray(::Array, (3,1,2))`.
 Unlike `batched_mul` this will never make a copy.
 
@@ -215,15 +241,27 @@ function batched_mul!(C::AbstractArray{T,3}, A::AbstractArray{<:Any,3}, B::Abstr
     C
 end
 
+function batched_mul!(C::AbstractArray{T,N}, A::AbstractArray{<:Any,N}, B::AbstractArray{<:Any,N},
+        α::Number=one(T), β::Number=zero(T)) where {T,N}
+    batch_size = size(C)[3:end]
+    size(A)[3:end] == batch_size || throw(DimensionMismatch("batch size of A must match C"))
+    size(B)[3:end] == batch_size || throw(DimensionMismatch("batch size of B must match C"))
+    C2 = reshape(C, size(C, 1), size(C, 2), :)
+    A2 = reshape(A, size(A, 1), size(A, 2), :)
+    B2 = reshape(B, size(B, 1), size(B, 2), :)
+    batched_mul!(C2, A2, B2, α, β)
+    return C
+end
+
 _batched_mul!(::Type, C, A, B, α::Number, β::Number) = batched_mul_generic!(C, A, B, α, β)
 
 _batched_mul!(::Type{DT}, C, A, B, α::Number, β::Number) where {DT<:DenseArray{T}} where {T<:BlasFloat} =
     _batched_try_gemm!(DT, C, A, B, α, β)
 
-function _batched_try_gemm!(::Type{DT}, C, A, B, α::Number, β::Number) where {DT<:DenseArray{T}} where {T<:BlasFloat}
-
-    alpha, beta = promote(α, β, zero(T))
-    alpha isa T && beta isa T || return batched_mul_generic!(C, A, B, α, β)
+function _batched_try_gemm!(::Type{DT}, C, A, B, α::Number, β::Number,
+                            ::Type{S}=T) where {T,DT<:DenseArray{T},S}
+    alpha, beta = promote(α, β, zero(S))
+    alpha isa S && beta isa S || return batched_mul_generic!(C, A, B, α, β)
 
     are_strided(_unbatch(A), _unbatch(B)) || return batched_mul_generic!(C, A, B, α, β)
     C isa StridedArray || return batched_mul_generic!(C, A, B, α, β)

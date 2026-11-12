@@ -1,5 +1,4 @@
 ## This file contains direct Julia implementations of 2d and 3d convolutions
-using Base.Threads
 
 # Helper functions for restricting x/w overreach
 function clamp_lo(x, w)
@@ -48,30 +47,49 @@ conv_direct!
 function conv_direct!(y::AbstractArray{yT,5}, x::AbstractArray{xT,5},
                       w::AbstractArray{wT,5}, cdims::DenseConvDims;
                       alpha::yT = yT(1), beta = false) where {yT, xT, wT}
+    conv_direct!(
+        y, x, w, cdims,
+        Val(kernel_size(cdims)), Val(channels_out(cdims)),
+        Val(padding(cdims)), Val(dilation(cdims)), Val(stride(cdims)),
+        Val(flipkernel(cdims)); alpha, beta)
+    return y
+end
+
+
+function conv_direct!(
+    y::AbstractArray{yT,5}, x::AbstractArray{xT,5},
+    w::AbstractArray{wT,5}, cdims::DenseConvDims,
+    # kernel size, output channels, padding, dilation, stride, flipped kernel
+    ::Val{K}, ::Val{C}, ::Val{P}, ::Val{D}, ::Val{S}, fk::Val{F};
+    alpha::yT = yT(1), beta = false,
+) where {yT, xT, wT, K, C, P, D, S, F}
     check_dims(size(x), size(w), size(y), cdims)
 
     width, height, depth = input_size(cdims)
-    kernel_w, kernel_h, kernel_d = kernel_size(cdims)
-    out_c = channels_out(cdims)
-    pad_w_lo, pad_w_hi, pad_h_lo, pad_h_hi, pad_d_lo, pad_d_hi = padding(cdims)
-    dil_w, dil_h, dil_d = dilation(cdims)
-    stride_w, stride_h, stride_d = stride(cdims)
-    out_width, out_height, out_depth = output_size(cdims)
-    
-    # Create a method that, at compile-time, determines how we're going to index into `w`
-    kproj(k, M, cdims::ConvDims{N,S,P,D,true}) where {N, S, P, D} = k
-    kproj(k, M, cdims::ConvDims{N,S,P,D,false}) where {N, S, P, D} = M - k + 1
-    
+    kernel_w, kernel_h, kernel_d = K
+    pad_w_lo, _, pad_h_lo, _, pad_d_lo, _ = P
+    dil_w, dil_h, dil_d = D
+    stride_w, stride_h, stride_d = S
+
+    # Create a method that determines how we're going to index into `w`.
+    kproj(k, _, ::Val{true}) = k
+    kproj(k, M, ::Val{false}) = M - k + 1
+
     # A helper function to project from output (w, h) to input (input_w, input_h)
     project(idx, stride, pad) = (idx - 1)*stride - pad + 1
-    
+
     # Use `calc_padding_regions` to determine where we do or don't need to worry about padding
     padded_regions, central_region = calc_padding_regions(cdims)
+
+    # Set outputs to zero to support custom datatypes (https://github.com/FluxML/NNlib.jl/issues/490)
+    if iszero(beta)
+        y = fill!(y, zero(yT))
+    end
 
     # Start with the central region
     w_region, h_region, d_region = central_region
     @inbounds for batch in 1:size(x, 5),
-        c_out in 1:out_c,
+        c_out in 1:C,
         d_idx in d_region,
         h_idx in h_region,
         w_idx in w_region
@@ -89,9 +107,9 @@ function conv_direct!(y::AbstractArray{yT,5}, x::AbstractArray{xT,5},
             x_w = project(w_idx, stride_w, pad_w_lo) + (kw - 1)*dil_w
 
             x_val = x[x_w, x_h, x_d, c_in, batch]
-            w_val = w[kproj(kw, kernel_w, cdims),
-                    kproj(kh, kernel_h, cdims),
-                    kproj(kd, kernel_d, cdims),
+            w_val = w[kproj(kw, kernel_w, fk),
+                    kproj(kh, kernel_h, fk),
+                    kproj(kd, kernel_d, fk),
                     c_in, c_out]
             dotprod = muladd(x_val, w_val, dotprod)
         end
@@ -101,7 +119,7 @@ function conv_direct!(y::AbstractArray{yT,5}, x::AbstractArray{xT,5},
     # Next, do potentially-padded regions:
     @inbounds for (w_region, h_region, d_region) in padded_regions,
         batch in 1:size(x, 5),
-        c_out in 1:out_c,
+        c_out in 1:C,
         d_idx in d_region,
         h_idx in h_region,
         w_idx in w_region
@@ -129,9 +147,9 @@ function conv_direct!(y::AbstractArray{yT,5}, x::AbstractArray{xT,5},
                     end
 
                     x_val = x[x_w, x_h, x_d, c_in, batch]
-                    w_val = w[kproj(kw, kernel_w, cdims),
-                            kproj(kh, kernel_h, cdims),
-                            kproj(kd, kernel_d, cdims),
+                    w_val = w[kproj(kw, kernel_w, fk),
+                            kproj(kh, kernel_h, fk),
+                            kproj(kd, kernel_d, fk),
                             c_in, c_out]
                     dotprod = muladd(x_val, w_val, dotprod)
                 end
@@ -155,7 +173,7 @@ Calculate the gradient imposed upon `x` in the convolution `y = x * w`.
 function ∇conv_data_direct!(dx::AbstractArray{xT,5}, dy::AbstractArray{yT,5},
                             w::AbstractArray{wT,5}, cdims::DenseConvDims;
                             alpha::xT=xT(1), beta=false) where {xT, yT, wT}
-    w = transpose_swapbatch(w[end:-1:1, end:-1:1, end:-1:1, :, :])
+    w = conj(transpose_swapbatch(w[end:-1:1, end:-1:1, end:-1:1, :, :]))
     dy = predilate(dy, stride(cdims))
     ctdims = DenseConvDims(dy, w; padding=transpose_pad(cdims),
                                   dilation=dilation(cdims),
@@ -174,13 +192,21 @@ Calculate the gradient imposed upon `w` in the convolution `y = x * w`.
 function ∇conv_filter_direct!(dw::AbstractArray{wT,5}, x::AbstractArray{xT,5},
                               dy::AbstractArray{yT,5}, cdims::DenseConvDims;
                               alpha::wT=wT(1), beta=false) where {xT, yT, wT}
-    x = transpose_swapbatch(x[end:-1:1, end:-1:1, end:-1:1, :, :])
+    # Zero-sized batch: nothing to accumulate, so the result is `beta*dw`. Bail
+    # out before `transpose_swapbatch` moves the empty batch into the channel
+    # slot, where `DenseConvDims` would divide by it (0 % 0). See issue #760.
+    if size(x, 5) == 0
+        return iszero(beta) ? fill!(dw, zero(wT)) : (dw .*= beta)
+    end
+    x = conj(transpose_swapbatch(x[end:-1:1, end:-1:1, end:-1:1, :, :]))
     dy = transpose_swapbatch(predilate(dy, stride(cdims)))
     ctdims = DenseConvDims(dy, x; padding=transpose_pad(cdims),
                                     stride=dilation(cdims))
-    conv_direct!(dw, dy, x, ctdims; alpha=alpha, beta=beta)
-    if flipkernel(cdims)
-        dw .= dw[end:-1:1, end:-1:1, end:-1:1, :, :]
+    dw_ = if flipkernel(cdims)
+        view(dw, reverse(axes(dw, 1)), reverse(axes(dw, 2)), reverse(axes(dw, 3)), :, :)
+    else
+        dw
     end
+    conv_direct!(dw_, dy, x, ctdims; alpha=alpha, beta=beta)
     return dw
 end

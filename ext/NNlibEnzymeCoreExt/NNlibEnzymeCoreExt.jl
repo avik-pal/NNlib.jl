@@ -1,0 +1,1030 @@
+module NNlibEnzymeCoreExt
+
+using NNlib
+import EnzymeCore
+using Random
+import ChainRulesCore
+
+using EnzymeCore.EnzymeRules
+
+# Enzyme rewrites `within_autodiff()` to `true` in the code it differentiates.
+NNlib._within_autodiff(::Val{:Enzyme}) = EnzymeCore.within_autodiff()
+
+for (name, dataname, filtername) in (
+                                     (typeof(NNlib.conv!), NNlib.∇conv_data!, NNlib.∇conv_filter!),
+                                     (typeof(NNlib.depthwiseconv!), NNlib.∇depthwiseconv_data!, NNlib.∇depthwiseconv_filter!),
+                                     (typeof(NNlib.∇conv_data!), NNlib.conv!, NNlib.∇conv_filter!),
+                                     (typeof(NNlib.∇conv_filter!), NNlib.∇conv_data!, NNlib.conv!),
+                                    )
+    @eval begin
+
+		function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{$name}, ::Type{RT},
+		                                                y::EnzymeCore.Annotation{<:AbstractArray{yT, N}},
+		                                                x::EnzymeCore.Annotation{<:AbstractArray{xT, N}},
+		                                                w::EnzymeCore.Annotation{<:AbstractArray{wT, N}},
+		                                                cdims; kwargs...) where {RT, yT, xT, wT, N}
+
+		    if typeof(y) <: EnzymeCore.Duplicated || typeof(y) <: EnzymeCore.BatchDuplicated
+		        func.val(y.val, x.val, w.val, cdims.val; kwargs...)
+		    end
+
+		    primal = if EnzymeRules.needs_primal(config)
+		        y.val
+		    else
+		        nothing
+		    end
+		    shadow = if EnzymeRules.needs_shadow(config)
+		        y.dval
+		    else
+		        nothing
+		    end
+
+		    # Cache x if its overwritten and w is active (and thus required)
+		    cache_x = ( EnzymeRules.overwritten(config)[3]
+		                && !(typeof(w) <: EnzymeCore.Const)
+		                && !(typeof(y) <: EnzymeCore.Const)
+		                ) ? copy(x.val) : nothing
+
+		    # Cache w if its overwritten and x is active (and thus required)
+		    cache_w = ( EnzymeRules.overwritten(config)[4]
+		                && !(typeof(x) <: EnzymeCore.Const)
+		                && !(typeof(y) <: EnzymeCore.Const)
+		                ) ? copy(w.val) : nothing
+
+		    cache = (cache_x, cache_w)
+
+		    return EnzymeRules.AugmentedReturn(primal, shadow, cache)
+		end
+
+		function EnzymeRules.reverse(config, func::EnzymeCore.Const{$name}, ::Type{RT}, cache,
+		                                                y::EnzymeCore.Annotation{<:AbstractArray{yT, N}},
+		                                                x::EnzymeCore.Annotation{<:AbstractArray{xT, N}},
+		                                                w::EnzymeCore.Annotation{<:AbstractArray{wT, N}},
+		                                                cdims; kwargs...) where {RT, yT, xT, wT, N}
+		    cache_x, cache_w = cache
+
+		    # Don't cache x if not overwritten and w is active (and thus required)
+		    if !(typeof(w) <: EnzymeCore.Const) && !(typeof(y) <: EnzymeCore.Const)
+		        if !EnzymeRules.overwritten(config)[3]
+		            cache_x = x.val
+		        end
+		    end
+
+		    # Don't cache w if not overwritten and x is active (and thus required)
+		    if !(typeof(x) <: EnzymeCore.Const) && !(typeof(y) <: EnzymeCore.Const)
+		        if !EnzymeRules.overwritten(config)[4]
+		            cache_w = w.val
+		        end
+		    end
+
+		    dys = y.dval
+		    dxs = (typeof(x) <: EnzymeCore.Const) ? dys : x.dval
+		    dws = (typeof(w) <: EnzymeCore.Const) ? dys : w.dval
+
+		    if EnzymeRules.width(config) == 1
+		        dys = (dys,)
+		        dxs = (dxs,)
+		        dws = (dws,)
+		    end
+
+		    for (dy, dx, dw) in zip(dys, dxs, dws)
+		        if !(typeof(y) <: EnzymeCore.Const) && dy !== y.val
+
+		            if !(typeof(x) <: EnzymeCore.Const) && dx !== x.val
+		                # dx += grad wrt x.val
+		                $dataname(dx, $(name != typeof(NNlib.∇conv_filter!) ? :dy : :cache_w), $(name != typeof(NNlib.∇conv_filter!) ? :cache_w : :dy), cdims.val; alpha=xT(1), beta=xT(1), kwargs...)
+		            end
+		            if !(typeof(w) <: EnzymeCore.Const) && dw !== w.val
+		                # dw += grad wrt w.val
+                        $filtername(dw, $(name != typeof(NNlib.∇conv_data!) ? :cache_x : :dy), $(name != typeof(NNlib.∇conv_data!) ? :dy : :cache_x), cdims.val; alpha=wT(1), beta=wT(1), kwargs...)
+		            end
+		            
+		            dy .= 0
+		        end
+		    end
+
+		    return (nothing, nothing, nothing, nothing)
+		end
+
+end
+end
+
+# `kws` is `checkbounds`, which the reverse pass does not need: its indices are checked.
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof(NNlib.gather!)}, ::Type{RT}, dst::OutType, src, idx::EnzymeCore.Annotation; kws...) where {OutType, RT}
+
+    # a Const dst is still written, it just has no shadow and passes nothing back
+    if OutType <: EnzymeCore.Const
+        func.val(dst.val, src.val, idx.val; kws...)
+        primal = EnzymeRules.needs_primal(config) ? dst.val : nothing
+        shadow = EnzymeRules.needs_shadow(config) ? _enz_shadow(config, dst.val) : nothing
+        return EnzymeRules.AugmentedReturn(primal, shadow, nothing)
+    end
+
+    if OutType <: EnzymeCore.Duplicated || OutType <: EnzymeCore.BatchDuplicated
+        func.val(dst.val, src.val, idx.val; kws...)
+    end
+
+    primal = if EnzymeRules.needs_primal(config)
+        dst.val
+    else
+        nothing
+    end
+    shadow = if EnzymeRules.needs_shadow(config)
+        dst.dval
+    else
+        nothing
+    end
+
+    # Cache idx if its overwritten
+    cache_idx = ( EnzymeRules.overwritten(config)[4]
+                    && !(typeof(src) <: EnzymeCore.Const)
+                    && !(typeof(dst) <: EnzymeCore.Const)
+                    ) ? copy(idx.val) : nothing
+
+    return EnzymeRules.AugmentedReturn(primal, shadow, cache_idx)
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof(NNlib.gather!)}, ::Type{RT}, cache_idx, dst::OutType, src, idx::EnzymeCore.Annotation; kws...) where {OutType, RT}
+
+    OutType <: EnzymeCore.Const && return (nothing, nothing, nothing)
+
+    # Don't cache idx if not overwritten
+    if !(typeof(src) <: EnzymeCore.Const) && !(typeof(dst) <: EnzymeCore.Const)
+        if !EnzymeRules.overwritten(config)[4]
+            cache_idx = idx.val
+        end
+    end
+
+    ddsts = dst.dval
+    dsrcs = (typeof(src) <: EnzymeCore.Const) ? ddsts : src.dval
+
+    if EnzymeRules.width(config) == 1
+        ddsts = (ddsts,)
+        dsrcs = (dsrcs,)
+    end
+
+    for (ddst, dsrc) in zip(ddsts, dsrcs)
+        if !(typeof(dst) <: EnzymeCore.Const) && ddst !== dst.val
+
+            if !(typeof(src) <: EnzymeCore.Const) && dsrc !== src.val
+                NNlib.scatter!(+, dsrc, ddst, cache_idx; checkbounds = false)
+            end
+
+            ddst .= 0
+        end
+    end
+
+    return (nothing, nothing, nothing)
+end
+
+
+
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof(NNlib.scatter!)}, ::Type{RT}, op::EnzymeCore.Const, dst::OutType, src, idx::EnzymeCore.Annotation; kws...) where {OutType, RT}
+
+    # a Const dst is still written, it just has no shadow and passes nothing back
+    if OutType <: EnzymeCore.Const
+        func.val(op.val, dst.val, src.val, idx.val; kws...)
+        primal = EnzymeRules.needs_primal(config) ? dst.val : nothing
+        shadow = EnzymeRules.needs_shadow(config) ? _enz_shadow(config, dst.val) : nothing
+        return EnzymeRules.AugmentedReturn(primal, shadow, nothing)
+    end
+
+    # `max`/`min` need the pre-scatter dst to tell which entries survived, `*`/`/` to scale
+    # the gradient of src
+    is_minmax = op.val isa Union{typeof(max),typeof(min)}
+    reads_old = is_minmax || op.val isa Union{typeof(*),typeof(/)}
+    dst_old = reads_old ? copy(dst.val) : nothing
+    if OutType <: EnzymeCore.Duplicated || OutType <: EnzymeCore.BatchDuplicated
+        func.val(op.val, dst.val, src.val, idx.val; kws...)
+    end
+
+    primal = if EnzymeRules.needs_primal(config)
+        dst.val
+    else
+        nothing
+    end
+    shadow = if EnzymeRules.needs_shadow(config)
+        dst.dval
+    else
+        nothing
+    end
+
+    # `overwritten` counts `func` too, so op, dst, src, idx are at 2:5. The reverse of
+    # `max`/`min` also reads src and the post-scatter dst, that of `*`/`/` reads src and
+    # idx even for a Const src: cache those if overwritten.
+    overwritten = EnzymeRules.overwritten(config)
+    cache_dst = (is_minmax && overwritten[3]) ? copy(dst.val) : nothing
+    cache_src = (reads_old && overwritten[4]) ? copy(src.val) : nothing
+    cache_idx = overwritten[5] ? copy(idx.val) : nothing
+
+    return EnzymeRules.AugmentedReturn(primal, shadow, (cache_idx, dst_old, cache_dst, cache_src))
+end
+
+function EnzymeRules.reverse(config,
+										func::EnzymeCore.Const{typeof(NNlib.scatter!)},
+										::Type{RT},
+										cache,
+										op::EnzymeCore.Const{<:Union{typeof(+),typeof(-),typeof(*),typeof(/),typeof(max),typeof(min),typeof(NNlib.mean)}},
+										dst::OutType,
+										src,
+										idx::EnzymeCore.Annotation; kws...) where {OutType, RT}
+
+    OutType <: EnzymeCore.Const && return (nothing, nothing, nothing, nothing)
+
+    cache_idx, dst_old, cache_dst, cache_src = cache
+
+    # Don't cache idx if not overwritten
+    if !EnzymeRules.overwritten(config)[5]
+        cache_idx = idx.val
+    end
+    dst_val = something(cache_dst, dst.val)
+    src_val = something(cache_src, src.val)
+
+    ddsts = dst.dval
+    dsrcs = (typeof(src) <: EnzymeCore.Const) ? ddsts : src.dval
+
+    if EnzymeRules.width(config) == 1
+        ddsts = (ddsts,)
+        dsrcs = (dsrcs,)
+    end
+
+    for (ddst, dsrc) in zip(ddsts, dsrcs)
+        if !(typeof(dst) <: EnzymeCore.Const) && ddst !== dst.val
+
+            if !(typeof(src) <: EnzymeCore.Const) && dsrc !== src.val
+                dsrc .+= NNlib.∇scatter!_src(op.val, ddst, dst_old, dst_val, src_val, cache_idx)
+            end
+
+            # after dsrc, which reads the same seed; the other ops pass the seed through
+            if dst_old !== nothing
+                ddst .= NNlib.∇scatter!_dst(op.val, ddst, dst_old, dst_val, src_val, cache_idx)
+            end
+
+        end
+    end
+
+    return (nothing, nothing, nothing, nothing)
+end
+
+
+
+for pool in [:maxpool, :meanpool, :lpnormpool]
+    pool! = Symbol(pool, :!)
+    ∇pool = Symbol(:∇, pool, :!)
+
+    @eval begin
+
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof($pool!)}, ::Type{RT}, y::OutType, x, dims; kwargs...) where {OutType, RT}
+
+    if OutType <: EnzymeCore.Duplicated || OutType <: EnzymeCore.BatchDuplicated
+        func.val(y.val, x.val, dims.val; kwargs...)
+    end
+
+    primal = if EnzymeRules.needs_primal(config)
+        y.val
+    else
+        nothing
+    end
+    shadow = if EnzymeRules.needs_shadow(config)
+        y.dval
+    else
+        nothing
+    end
+
+    cache_y = ( EnzymeRules.overwritten(config)[2] 
+                && !(typeof(x) <: EnzymeCore.Const) 
+                && !(typeof(y) <: EnzymeCore.Const) 
+                ) ? copy(y.val) : nothing
+
+    cache_x = ( EnzymeRules.overwritten(config)[3]
+                && !(typeof(x) <: EnzymeCore.Const) 
+                && !(typeof(y) <: EnzymeCore.Const) 
+                ) ? copy(x.val) : nothing
+
+    cache = (cache_y, cache_x)
+
+    return EnzymeRules.AugmentedReturn(primal, shadow, cache)
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof($pool!)}, ::Type{RT}, cache, y, x, dims; kwargs...) where {RT}
+    cache_y, cache_x = cache
+
+    # Don't cache y if not overwritten
+    if !(typeof(x) <: EnzymeCore.Const) && !(typeof(y) <: EnzymeCore.Const)
+        if !EnzymeRules.overwritten(config)[2]
+            cache_y = y.val
+        end
+    end
+
+    # Don't cache x if not overwritten
+    if !(typeof(x) <: EnzymeCore.Const) && !(typeof(y) <: EnzymeCore.Const)
+        if !EnzymeRules.overwritten(config)[3]
+            cache_x = x.val
+        end
+    end
+
+    dys = y.dval
+    dxs = (typeof(x) <: EnzymeCore.Const) ? dys : x.dval
+
+    if EnzymeRules.width(config) == 1
+        dys = (dys,)
+        dxs = (dxs,)
+    end
+
+    for (dy, dx) in zip(dys, dxs)
+        if !(typeof(y) <: EnzymeCore.Const) && dy !== y.val
+
+            if !(typeof(x) <: EnzymeCore.Const) && dx !== x.val
+                NNlib.$(∇pool)(dx, dy, cache_y, cache_x, dims.val; alpha=eltype(dx)(1), beta=eltype(dx)(1), kwargs...)
+            end
+
+            dy .= 0
+        end
+    end
+
+    return (nothing, nothing, nothing)
+end
+
+end
+end
+
+# `softmax!`/`logsoftmax!` gradients depend only on the output `y` (= the written
+# destination) and the seed `dy`, via `∇softmax!(dx, dy, y; dims)`. Without a rule
+# Enzyme would try to differentiate the underlying implementation directly — on a
+# GPU that is a cuDNN `ccall` it cannot handle (Enzyme recurses/hangs), and even on
+# the CPU a hand-off to `∇softmax!` matches the ChainRules `rrule`. The rule caches
+# `y` in the augmented pass and accumulates `∇softmax!` into the input shadow on
+# reverse. These are first-order rules, matching what `test_gradients` compares.
+for (fwd!, bwd!) in ((:(NNlib.softmax!),    :(NNlib.∇softmax!)),
+                     (:(NNlib.logsoftmax!), :(NNlib.∇logsoftmax!)))
+    @eval begin
+
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof($fwd!)}, ::Type{RT},
+                                      out::OutType, x; dims=1) where {OutType, RT}
+    if OutType <: EnzymeCore.Duplicated || OutType <: EnzymeCore.BatchDuplicated
+        func.val(out.val, x.val; dims)
+    end
+
+    primal = EnzymeRules.needs_primal(config) ? out.val : nothing
+    shadow = EnzymeRules.needs_shadow(config) ? out.dval : nothing
+
+    # Cache the output `y` (needed by `∇softmax!`); `out.val` may be overwritten
+    # downstream, so copy it unless neither input nor output is differentiated.
+    cache_y = ( !(typeof(x) <: EnzymeCore.Const) && !(typeof(out) <: EnzymeCore.Const)
+              ) ? copy(out.val) : nothing
+
+    return EnzymeRules.AugmentedReturn(primal, shadow, cache_y)
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof($fwd!)}, ::Type{RT}, cache_y,
+                             out::OutType, x; dims=1) where {OutType, RT}
+    if !(typeof(x) <: EnzymeCore.Const) && !(typeof(out) <: EnzymeCore.Const)
+        dys = out.dval
+        dxs = x.dval
+        if EnzymeRules.width(config) == 1
+            dys = (dys,)
+            dxs = (dxs,)
+        end
+
+        for (dy, dx) in zip(dys, dxs)
+            # `∇softmax!` overwrites its destination, so accumulate via a temporary.
+            dx .+= $bwd!(similar(dx), dy, cache_y; dims)
+            dy .= 0
+        end
+    end
+
+    return (nothing, nothing)
+end
+
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Allocating ops whose gradient has a dedicated `∇` kernel: `imrotate`,
+# `upsample_nearest`, `upsample_linear` (the latter also covers `upsample_bi/
+# trilinear`, which forward to it), `_upsample_separable` (`upsample_bicubic`, and
+# `upsample_bilinear` with `antialias`). Enzyme cannot differentiate these forward
+# kernels on the GPU ("Active kernel arguments not supported"), so we wrap them:
+# the augmented pass allocates the output shadow, and the reverse pass feeds it to
+# the `∇` kernel and accumulates into the input shadow. This mirrors each op's
+# ChainRules `rrule`. (Written explicitly rather than via `Enzyme.@import_rrule`,
+# per Enzyme maintainers' recommendation, and so the rules stay in the lighter
+# EnzymeCore extension.)
+
+# Allocate the return shadow (a zeroed copy of `y`), respecting the batch width.
+_enz_shadow(config, y) =
+    EnzymeRules.width(config) == 1 ? EnzymeCore.make_zero(y) :
+        ntuple(_ -> EnzymeCore.make_zero(y), EnzymeRules.width(config))
+
+# The i-th slice of a return-shadow / input-shadow across the batch width.
+# `Val`-dispatched so the width-1 method never contains an array `getindex`:
+# on a width-1 `Duplicated`, `.dval` is the array itself (not a tuple of arrays),
+# and indexing it would scalar-index the GPU array (and poison broadcast typing).
+_enz_slice(::Val{1}, s, i) = s
+_enz_slice(::Val{W}, s, i) where {W} = s[i]
+
+# --- Shared scaffolding for allocating ops `y = f(...)` -----------------------
+# Each such rule (imrotate, upsample_*, grid_sample, batchnorm, unfold, fold, ...)
+# runs the forward, allocates an output shadow, and on reverse feeds that shadow to
+# the op's `∇` function and accumulates the result into each differentiable input.
+# These three helpers capture that plumbing so the rules stay a few lines each.
+
+# The shadow of a differentiable input (`nothing` for a `Const` one, or for one that runtime
+# activity found constant, whose shadow is the input itself).
+_enz_dval(a::EnzymeCore.Const) = nothing
+_enz_dval(a) = a.dval === a.val ? nothing : a.dval
+
+# Standard augmented pass: expose primal/shadow per `config`, allocate the output
+# shadow, and stash `(shadow, dvals, extra...)` as the reverse-pass cache, where `dvals`
+# are the shadows of the differentiable inputs `args`.
+#
+# The input shadows are captured here, not read back from the arguments of `reverse`:
+# Enzyme can hand the reverse rule a bogus (empty) shadow for an array argument when the
+# rule'd call sits in a non-inlined function that returns its result (hit by
+# `upsample_nearest` on Julia 1.13), whereas the augmented pass gets the right one.
+@inline function _enz_alloc_augmented(config, y, args::Tuple, extra::Tuple)
+    shadow = EnzymeRules.needs_shadow(config) ? _enz_shadow(config, y) : nothing
+    primal = EnzymeRules.needs_primal(config) ? y : nothing
+    return EnzymeRules.AugmentedReturn(primal, shadow, (shadow, map(_enz_dval, args), extra...))
+end
+
+# Type-stable tuple unroll of the per-input accumulation (a `zip(dvals, grads)` loop
+# over these heterogeneous tuples would be dynamically dispatched).
+@inline _enz_accum!(wv, i, ::Tuple{}, ::Tuple{}) = nothing
+@inline function _enz_accum!(wv, i, dvals::Tuple, grads::Tuple)
+    d, g = dvals[1], grads[1]
+    (d === nothing || g === nothing) || (_enz_slice(wv, d, i) .+= g)
+    _enz_accum!(wv, i, Base.tail(dvals), Base.tail(grads))
+end
+
+# Reverse pass: for each batch slice, `backward(dy)` returns a tuple of cotangents
+# aligned 1:1 with the input shadows `dvals` cached by `_enz_alloc_augmented`;
+# accumulate each into its shadow. `backward` must return one cotangent per input —
+# a single-output `∇` has to be wrapped in a 1-tuple.
+@inline function _enz_alloc_reverse!(config, shadow, dvals::Tuple, backward)
+    all(isnothing, dvals) && return nothing
+    wv = Val(EnzymeRules.width(config))
+    for i in 1:EnzymeRules.width(config)
+        grads = backward(_enz_slice(wv, shadow, i))
+        @assert length(grads) == length(dvals) "backward must return one cotangent per input"
+        _enz_accum!(wv, i, dvals, grads)
+    end
+    return nothing
+end
+
+# Reverse pass for a scalar (`Active`-return) op, e.g. `ctc_loss`: the incoming
+# cotangent is `dval.val` (a scalar, or a width-tuple of scalars); accumulate
+# `Δ .* grad` into `arg`'s shadow.
+@inline function _enz_active_reverse!(config, dval, arg, grad)
+    arg isa EnzymeCore.Const && return nothing
+    wv = Val(EnzymeRules.width(config))
+    for i in 1:EnzymeRules.width(config)
+        _enz_slice(wv, arg.dval, i) .+= _enz_slice(wv, dval.val, i) .* grad
+    end
+    return nothing
+end
+
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof(NNlib.imrotate)},
+        ::Type{RT}, arr, θ;
+        method=:bilinear, rotation_center=size(arr.val) .÷ 2 .+ 1) where {RT}
+    y = func.val(arr.val, θ.val; method, rotation_center)
+    # `∇imrotate` reads only `arr`'s shape/backend (the op is linear in `arr`), so
+    # keeping `arr.val` — not a copy — is safe even if it is later overwritten.
+    return _enz_alloc_augmented(config, y, (arr,), (arr.val, θ.val, method, rotation_center))
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof(NNlib.imrotate)},
+        ::Type{RT}, cache, arr, θ; kwargs...) where {RT}
+    shadow, dvals, arr_val, θ_val, method, rotation_center = cache
+    _enz_alloc_reverse!(config, shadow, dvals,
+        dy -> (NNlib.∇imrotate(dy, arr_val, θ_val; method, rotation_center),))
+    return (nothing, nothing)   # θ is `NoTangent` in the rrule
+end
+
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof(NNlib.upsample_nearest)},
+        ::Type{RT}, x, s) where {RT}
+    y = func.val(x.val, s.val)
+    return _enz_alloc_augmented(config, y, (x,), (s.val,))
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof(NNlib.upsample_nearest)},
+        ::Type{RT}, cache, x, s) where {RT}
+    shadow, dvals, scales = cache
+    _enz_alloc_reverse!(config, shadow, dvals, dy -> (NNlib.∇upsample_nearest(dy, scales),))
+    return (nothing, nothing)
+end
+
+# Keyword form `upsample_nearest(x; size)`, handled directly instead of differentiating
+# through the method that forwards it to the positional one.
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof(NNlib.upsample_nearest)},
+        ::Type{RT}, x; size) where {RT}
+    y = func.val(x.val; size)
+    scales = size .÷ Base.size(x.val)[1:length(size)]
+    return _enz_alloc_augmented(config, y, (x,), (scales,))
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof(NNlib.upsample_nearest)},
+        ::Type{RT}, cache, x; kwargs...) where {RT}
+    shadow, dvals, scales = cache
+    _enz_alloc_reverse!(config, shadow, dvals, dy -> (NNlib.∇upsample_nearest(dy, scales),))
+    return (nothing,)
+end
+
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof(NNlib.upsample_linear)},
+        ::Type{RT}, x; size, align_corners::Bool=true) where {RT}
+    y = func.val(x.val; size, align_corners)
+    # `∇upsample_linear` needs the original spatial size of `x` (see the rrule).
+    insize = Base.size(x.val)[1:ndims(x.val)-2]
+    return _enz_alloc_augmented(config, y, (x,), (insize, align_corners))
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof(NNlib.upsample_linear)},
+        ::Type{RT}, cache, x; kwargs...) where {RT}
+    shadow, dvals, insize, align_corners = cache
+    _enz_alloc_reverse!(config, shadow, dvals,
+        dy -> (NNlib.∇upsample_linear(dy; size=insize, align_corners),))
+    return (nothing,)
+end
+
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof(NNlib._upsample_separable)},
+        ::Type{RT}, x, size, mode, align_corners, antialias) where {RT}
+    y = func.val(x.val, size.val, mode.val, align_corners.val, antialias.val)
+    insize = Base.size(x.val)[1:ndims(x.val)-2]
+    return _enz_alloc_augmented(config, y, (x,), (insize, mode.val, align_corners.val, antialias.val))
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof(NNlib._upsample_separable)},
+        ::Type{RT}, cache, x, size, mode, align_corners, antialias) where {RT}
+    shadow, dvals, insize, mode, align_corners, antialias = cache
+    _enz_alloc_reverse!(config, shadow, dvals,
+        dy -> (NNlib.∇_upsample_separable(dy, insize, mode, align_corners, antialias),))
+    return (nothing, nothing, nothing, nothing, nothing)
+end
+
+# `grid_sample(x, grid)` — allocating, differentiable in both `x` and `grid`;
+# `∇grid_sample(dy, x, grid)` returns `(∇x, ∇grid)` and reads the input & grid
+# values, so both are cached.
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof(NNlib.grid_sample)},
+        ::Type{RT}, x, grid; padding_mode=:zeros) where {RT}
+    y = func.val(x.val, grid.val; padding_mode)
+    return _enz_alloc_augmented(config, y, (x, grid), (copy(x.val), copy(grid.val), padding_mode))
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof(NNlib.grid_sample)},
+        ::Type{RT}, cache, x, grid; kwargs...) where {RT}
+    shadow, dvals, xval, gridval, padding_mode = cache
+    # `∇grid_sample` already returns the `(∇x, ∇grid)` tuple aligned with `(x, grid)`.
+    _enz_alloc_reverse!(config, shadow, dvals,
+        dy -> NNlib.∇grid_sample(dy, xval, gridval; padding_mode))
+    return (nothing, nothing)
+end
+
+# `ctc_loss(ŷ, y)` returns a scalar (Active return), differentiable in `ŷ` only
+# (`y` is the target). We reuse `ctc_alpha` from the augmented pass and feed it to
+# `∇ctc_loss` on reverse, scaled by the incoming cotangent `dval.val`.
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof(NNlib.ctc_loss)},
+        ::Type{RT}, ŷ, y) where {RT}
+    tmp = NNlib.ctc_alpha(ŷ.val, y.val)
+    primal = EnzymeRules.needs_primal(config) ? tmp.loss : nothing
+    return EnzymeRules.AugmentedReturn(primal, nothing, tmp)
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof(NNlib.ctc_loss)},
+        dval::EnzymeCore.Active, tmp, ŷ, y) where {}
+    if !(ŷ isa EnzymeCore.Const)
+        _enz_active_reverse!(config, dval, ŷ, NNlib.∇ctc_loss(ŷ.val, y.val, tmp))
+    end
+    return (nothing, nothing)
+end
+
+# `unfold(x, cdims)` / `fold(y, output_size, cdims)` are adjoints of each other
+# (the `unfold` pullback is `fold` and vice versa — see their rrules). Enzyme can't
+# differentiate the underlying `unfold!`/`fold!` KA kernels (LLVM verifier crash /
+# ReadOnlyMemoryError), so route the reverse pass through the sibling operator. The
+# rules target the `DenseConvDims` methods; the `kernel_size` convenience methods
+# forward to these, so Enzyme reaches the rule through them too.
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof(NNlib.unfold)},
+        ::Type{RT}, x, cdims::EnzymeCore.Const{<:NNlib.DenseConvDims}) where {RT}
+    y = func.val(x.val, cdims.val)
+    return _enz_alloc_augmented(config, y, (x,), (Base.size(x.val), cdims.val))
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof(NNlib.unfold)},
+        ::Type{RT}, cache, x, cdims::EnzymeCore.Const{<:NNlib.DenseConvDims}) where {RT}
+    shadow, dvals, xsize, cd = cache
+    _enz_alloc_reverse!(config, shadow, dvals, dy -> (NNlib.fold(dy, xsize, cd),))
+    return (nothing, nothing)
+end
+
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof(NNlib.fold)},
+        ::Type{RT}, x, output_size, cdims::EnzymeCore.Const{<:NNlib.DenseConvDims}) where {RT}
+    y = func.val(x.val, output_size.val, cdims.val)
+    return _enz_alloc_augmented(config, y, (x,), (cdims.val,))
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof(NNlib.fold)},
+        ::Type{RT}, cache, x, output_size, cdims::EnzymeCore.Const{<:NNlib.DenseConvDims}) where {RT}
+    shadow, dvals, cd = cache
+    _enz_alloc_reverse!(config, shadow, dvals, dy -> (NNlib.unfold(dy, cd),))
+    return (nothing, nothing, nothing)
+end
+
+function EnzymeRules.augmented_primal(config, func::EnzymeCore.Const{typeof(NNlib._dropout!)}, ::Type{RT}, rng, dst::OutType, src, p, dims) where {OutType, RT}
+
+    T = float(real(eltype(dst.val)))
+    val = convert(T, 1/(1-p.val))
+    keep = if dims.val isa Colon
+        similar(dst.val, T, size(dst.val))
+    else
+        similar(dst.val, T, ntuple(d -> d in dims.val ? size(dst.val,d) : 1, ndims(dst.val)))
+    end
+    rand!(rng.val, keep)
+    
+    keep = keep .> p.val
+
+    if OutType <: EnzymeCore.Duplicated || OutType <: EnzymeCore.BatchDuplicated
+        dst.val .= (keep .* val) .* src.val
+    end
+
+    primal = if EnzymeRules.needs_primal(config)
+        dst.val
+    else
+        nothing
+    end
+    shadow = if EnzymeRules.needs_shadow(config)
+        dst.dval
+    else
+        nothing
+    end
+
+    if typeof(dst) <: EnzymeCore.Const || typeof(src) <: EnzymeCore.Const
+        keep = nothing
+    end
+
+    return EnzymeRules.AugmentedReturn(primal, shadow, keep)
+end
+
+function EnzymeRules.reverse(config, func::EnzymeCore.Const{typeof(NNlib._dropout!)}, ::Type{RT}, keep, rng, dst::OutType, src, p, dims) where {OutType, RT}
+    T = float(real(eltype(dst.val)))
+    val = convert(T, 1/(1-p.val))
+
+    ddsts = dst.dval
+    dsrcs = (typeof(src) <: EnzymeCore.Const) ? ddsts : src.dval
+
+    if EnzymeRules.width(config) == 1
+        ddsts = (ddsts,)
+        dsrcs = (dsrcs,)
+    end
+
+    for (ddst, dsrc) in zip(ddsts, dsrcs)
+        if !(typeof(dst) <: EnzymeCore.Const) && ddst !== dst.val
+
+            if !(typeof(src) <: EnzymeCore.Const) && dsrc !== src.val
+                dsrc .+= (keep .* val) .* ddst
+            end
+
+            ddst .= 0
+        end
+    end
+
+    dp = if typeof(p) <: EnzymeCore.Active
+        typeof(p.val)(0)
+    else
+        nothing
+    end
+
+    return (nothing, nothing, nothing, dp, nothing)
+end
+
+
+# batched_mul
+#
+# Without a custom rule, Enzyme differentiates through NNlib's threaded
+# `batched_gemm!`, whose `Threads.@spawn`/`Threads.@sync` is not supported and
+# (on Julia 1.12) hits an internal `cmpxchg` error in `wait(::Task)`.
+# See https://github.com/FluxML/NNlib.jl/issues/707 and
+# https://github.com/EnzymeAD/Enzyme.jl/issues/3150.
+#
+# The derivatives mirror the ChainRules `rrule` in src/batched/batchedmul.jl:
+#   dA = Δ ⊠ Bᴴ   (summed over the batch dim if `size(A,3) == 1`)
+#   dB = Aᴴ ⊠ Δ   (summed over the batch dim if `size(B,3) == 1`)
+
+@inline _batched_mul_const(x) = x isa EnzymeCore.Const
+
+function EnzymeRules.forward(config::EnzymeRules.FwdConfig,
+        func::EnzymeCore.Const{typeof(NNlib.batched_mul)}, ::Type{RT},
+        A::EnzymeCore.Annotation{<:AbstractArray{<:Any,3}},
+        B::EnzymeCore.Annotation{<:AbstractArray{<:Any,3}}) where {RT}
+
+    bothconst = _batched_mul_const(A) && _batched_mul_const(B)
+
+    # The primal is needed if requested, or to size the zero tangent when both
+    # arguments are Const but a shadow is still required (e.g. runtime activity).
+    primal = (EnzymeRules.needs_primal(config) ||
+              (EnzymeRules.needs_shadow(config) && bothconst)) ?
+             func.val(A.val, B.val) : nothing
+
+    EnzymeRules.needs_shadow(config) || return primal
+
+    # dC = dA ⊠ B + A ⊠ dB (a missing term means that argument is Const)
+    dC(dA, dB) =
+        if bothconst
+            zero(primal)
+        elseif _batched_mul_const(A)
+            NNlib.batched_mul(A.val, dB)
+        elseif _batched_mul_const(B)
+            NNlib.batched_mul(dA, B.val)
+        else
+            NNlib.batched_mul(dA, B.val) .+ NNlib.batched_mul(A.val, dB)
+        end
+
+    shadow = if EnzymeRules.width(config) == 1
+        dC(_batched_mul_const(A) ? nothing : A.dval,
+           _batched_mul_const(B) ? nothing : B.dval)
+    else
+        ntuple(i -> dC(_batched_mul_const(A) ? nothing : A.dval[i],
+                       _batched_mul_const(B) ? nothing : B.dval[i]),
+               Val(EnzymeRules.width(config)))
+    end
+
+    EnzymeRules.needs_primal(config) || return shadow
+    return EnzymeRules.width(config) == 1 ?
+        EnzymeCore.Duplicated(primal, shadow) :
+        EnzymeCore.BatchDuplicated(primal, shadow)
+end
+
+function EnzymeRules.augmented_primal(config::EnzymeRules.RevConfig,
+        func::EnzymeCore.Const{typeof(NNlib.batched_mul)}, ::Type{RT},
+        A::EnzymeCore.Annotation{<:AbstractArray{<:Any,3}},
+        B::EnzymeCore.Annotation{<:AbstractArray{<:Any,3}}) where {RT}
+
+    C = func.val(A.val, B.val)
+
+    primal = EnzymeRules.needs_primal(config) ? C : nothing
+    shadow = if EnzymeRules.needs_shadow(config)
+        EnzymeRules.width(config) == 1 ? zero(C) :
+            ntuple(_ -> zero(C), Val(EnzymeRules.width(config)))
+    else
+        nothing
+    end
+
+    # Cache A if it's overwritten and needed for dB (i.e. B is active),
+    # cache B if it's overwritten and needed for dA (i.e. A is active).
+    cache_A = ( EnzymeRules.overwritten(config)[2]
+                && !_batched_mul_const(B) ) ? copy(A.val) : nothing
+    cache_B = ( EnzymeRules.overwritten(config)[3]
+                && !_batched_mul_const(A) ) ? copy(B.val) : nothing
+
+    return EnzymeRules.AugmentedReturn(primal, shadow, (shadow, cache_A, cache_B))
+end
+
+function EnzymeRules.reverse(config::EnzymeRules.RevConfig,
+        func::EnzymeCore.Const{typeof(NNlib.batched_mul)}, ::Type{RT}, tape,
+        A::EnzymeCore.Annotation{<:AbstractArray{<:Any,3}},
+        B::EnzymeCore.Annotation{<:AbstractArray{<:Any,3}}) where {RT}
+
+    dCs, cache_A, cache_B = tape
+
+    # Nothing to propagate if the return wasn't differentiated.
+    dCs === nothing && return (nothing, nothing)
+
+    # Recover values not cached because they were not overwritten.
+    if !_batched_mul_const(B) && cache_A === nothing
+        cache_A = A.val
+    end
+    if !_batched_mul_const(A) && cache_B === nothing
+        cache_B = B.val
+    end
+
+    dAs = _batched_mul_const(A) ? dCs : A.dval
+    dBs = _batched_mul_const(B) ? dCs : B.dval
+
+    if EnzymeRules.width(config) == 1
+        dCs = (dCs,)
+        dAs = (dAs,)
+        dBs = (dBs,)
+    end
+
+    for (dC, dA, dB) in zip(dCs, dAs, dBs)
+        if !_batched_mul_const(A)
+            tmp = NNlib.batched_mul(dC, NNlib.batched_adjoint(cache_B))
+            dA .+= size(A.val, 3) == 1 ? sum(tmp; dims=3) : tmp
+        end
+        if !_batched_mul_const(B)
+            tmp = NNlib.batched_mul(NNlib.batched_adjoint(cache_A), dC)
+            dB .+= size(B.val, 3) == 1 ? sum(tmp; dims=3) : tmp
+        end
+    end
+
+    return (nothing, nothing)
+end
+
+
+# collapse_batch_dims, flat_logits, interleaved_pairs, halved_pairs
+#
+# Reshapes, whose result aliases their argument. That of a constant `key`, `value` or
+# `bias` next to an active `query`, or of a constant input of `apply_rotary_embedding` next
+# to active tables, is constant memory Enzyme's activity analysis takes for active memory:
+# the shadow of the result is that of the argument reshaped, or scratch memory for a
+# constant argument.
+
+const AliasingReshape = Union{typeof(NNlib.collapse_batch_dims), typeof(NNlib.flat_logits),
+                              typeof(NNlib.interleaved_pairs), typeof(NNlib.halved_pairs)}
+
+function EnzymeRules.augmented_primal(config::EnzymeRules.RevConfig,
+        func::EnzymeCore.Const{<:AliasingReshape}, ::Type{RT},
+        x::EnzymeCore.Annotation{<:AbstractArray}) where {RT}
+    y = func.val(x.val)
+    shadow = EnzymeRules.needs_shadow(config) ? _collapsed_shadow(config, func.val, x, y) : nothing
+    return EnzymeRules.AugmentedReturn(EnzymeRules.needs_primal(config) ? y : nothing, shadow, nothing)
+end
+
+EnzymeRules.reverse(config::EnzymeRules.RevConfig, func::EnzymeCore.Const{<:AliasingReshape},
+                    ::Type{RT}, tape, x::EnzymeCore.Annotation{<:AbstractArray}) where {RT} = (nothing,)
+
+function EnzymeRules.forward(config::EnzymeRules.FwdConfig,
+        func::EnzymeCore.Const{<:AliasingReshape}, ::Type{RT},
+        x::EnzymeCore.Annotation{<:AbstractArray}) where {RT}
+    y = func.val(x.val)
+    EnzymeRules.needs_shadow(config) || return EnzymeRules.needs_primal(config) ? y : nothing
+    shadow = _collapsed_shadow(config, func.val, x, y)
+    EnzymeRules.needs_primal(config) || return shadow
+    return EnzymeRules.width(config) == 1 ? EnzymeCore.Duplicated(y, shadow) : EnzymeCore.BatchDuplicated(y, shadow)
+end
+
+function _collapsed_shadow(config, f, x, y)
+    N = EnzymeRules.width(config)
+    x isa EnzymeCore.Const && return N == 1 ? zero(y) : ntuple(_ -> zero(y), Val(N))
+    return N == 1 ? f(x.dval) : map(f, x.dval)
+end
+
+
+# fused_attention
+#
+# The fused attention runs tasks on the CPU and a kernel on the GPU, which are not to be
+# differentiated through. Reverse mode calls its gradient, as the ChainRules `rrule`
+# does, and forward mode differentiates the materialized implementation instead.
+
+const AttentionArray{T} = EnzymeCore.Annotation{<:AbstractArray{T,4}}
+
+_attention_cached(x, overwritten::Bool) = overwritten && x isa AbstractArray ? copy(x) : x
+
+function EnzymeRules.augmented_primal(config::EnzymeRules.RevConfig,
+        func::EnzymeCore.Const{typeof(NNlib.fused_attention)}, ::Type{RT},
+        q::AttentionArray{T}, k::AttentionArray{T}, v::AttentionArray{T},
+        bias::EnzymeCore.Const{Nothing}, mask::EnzymeCore.Annotation, scale::EnzymeCore.Annotation,
+        is_causal::EnzymeCore.Annotation, q_offset::EnzymeCore.Annotation,
+        q_lengths::EnzymeCore.Annotation, kv_lengths::EnzymeCore.Annotation,
+        segments::EnzymeCore.Annotation, window::EnzymeCore.Annotation) where {RT,T}
+
+    lse = similar(q.val, NNlib.attention_compute_type(T), size(q.val, 2), size(q.val, 3), size(q.val, 4))
+    o = func.val(q.val, k.val, v.val, nothing, mask.val, scale.val, is_causal.val, q_offset.val,
+                 q_lengths.val, kv_lengths.val, segments.val, window.val; lse)
+
+    primal = EnzymeRules.needs_primal(config) ? o : nothing
+    shadow = if EnzymeRules.needs_shadow(config)
+        EnzymeRules.width(config) == 1 ? zero(o) :
+            ntuple(_ -> zero(o), Val(EnzymeRules.width(config)))
+    else
+        nothing
+    end
+
+    # What the reverse pass reads, copied where the caller may overwrite it.
+    ow = EnzymeRules.overwritten(config)
+    tape = (shadow, EnzymeRules.needs_primal(config) ? copy(o) : o, lse,
+            _attention_cached(q.val, ow[2]), _attention_cached(k.val, ow[3]),
+            _attention_cached(v.val, ow[4]), _attention_cached(mask.val, ow[6]),
+            _attention_cached(q_offset.val, ow[9]), _attention_cached(q_lengths.val, ow[10]),
+            _attention_cached(kv_lengths.val, ow[11]), segments.val, window.val)
+    return EnzymeRules.AugmentedReturn(primal, shadow, tape)
+end
+
+function EnzymeRules.reverse(config::EnzymeRules.RevConfig,
+        func::EnzymeCore.Const{typeof(NNlib.fused_attention)}, ::Type{RT}, tape,
+        q::AttentionArray{T}, k::AttentionArray{T}, v::AttentionArray{T},
+        bias::EnzymeCore.Const{Nothing}, mask::EnzymeCore.Annotation, scale::EnzymeCore.Annotation,
+        is_causal::EnzymeCore.Annotation, q_offset::EnzymeCore.Annotation,
+        q_lengths::EnzymeCore.Annotation, kv_lengths::EnzymeCore.Annotation,
+        segments::EnzymeCore.Annotation, window::EnzymeCore.Annotation) where {RT,T}
+
+    douts, o, lse, qval, kval, vval, maskval, qoval, qlval, kvlval, segval, winval = tape
+    N = EnzymeRules.width(config)
+    active = scale isa EnzymeCore.Active
+    dscales = active ? ntuple(_ -> zero(scale.val), Val(N)) : nothing
+
+    if douts !== nothing
+        shadow(x, i) = N == 1 ? x.dval : x.dval[i]
+        grads = ntuple(Val(N)) do i
+            NNlib.fused_attention_grad(N == 1 ? douts : douts[i], o, lse, qval, kval, vval, nothing,
+                                       maskval, scale.val, is_causal.val, qoval, qlval, kvlval, segval,
+                                       winval)
+        end
+        for (i, (dq, dk, dv, _)) in enumerate(grads)
+            q isa EnzymeCore.Const || (shadow(q, i) .+= dq)
+            k isa EnzymeCore.Const || (shadow(k, i) .+= dk)
+            v isa EnzymeCore.Const || (shadow(v, i) .+= dv)
+        end
+        if active
+            dscales = map(g -> convert(typeof(scale.val), g[4]), grads)
+        end
+    end
+
+    dscale = active ? (N == 1 ? dscales[1] : dscales) : nothing
+    return (nothing, nothing, nothing, nothing, nothing, dscale, nothing, nothing, nothing, nothing, nothing,
+            nothing)
+end
+
+# the materialized implementation takes the offsets and the lengths as `(1, 1, 1, batch_size)` arrays
+_attention_per_batch(x::Union{Nothing,Integer}) = x
+_attention_per_batch(x::AbstractArray) = reshape(x, 1, 1, 1, :)
+
+_materialized_attention(q, k, v, bias, mask, scale, is_causal, q_offset, q_lengths, kv_lengths, segments,
+                        window) =
+    NNlib.materialized_attention(q, k, v, bias; fdrop=identity, mask, scale, is_causal, window,
+                                 q_offset=_attention_per_batch(q_offset),
+                                 q_lengths=_attention_per_batch(q_lengths),
+                                 kv_lengths=_attention_per_batch(kv_lengths), segments)
+
+function EnzymeRules.forward(config::EnzymeRules.FwdConfig,
+        func::EnzymeCore.Const{typeof(NNlib.fused_attention)}, ::Type{RT},
+        args::Vararg{EnzymeCore.Annotation,12}) where {RT}
+
+    EnzymeRules.needs_shadow(config) ||
+        return EnzymeRules.needs_primal(config) ? func.val(map(x -> x.val, args)...) : nothing
+
+    N = EnzymeRules.width(config)
+    ret = N == 1 ? EnzymeCore.Duplicated : EnzymeCore.BatchDuplicated
+    # with runtime activity: the materialized implementation mixes constant and active arrays
+    mode = EnzymeCore.set_runtime_activity(EnzymeCore.ForwardWithPrimal)
+    res = EnzymeCore.autodiff(mode, EnzymeCore.Const(_materialized_attention), ret, args...)
+    shadow = N == 1 ? res[1] : values(res[1])
+    EnzymeRules.needs_primal(config) || return shadow
+    return N == 1 ? EnzymeCore.Duplicated(res[2], shadow) : EnzymeCore.BatchDuplicated(res[2], shadow)
+end
+
+
+# batchnorm, instancenorm, groupnorm, layernorm, rmsnorm
+#
+# Reverse mode runs the ChainRules `rrule`, and its pullback on the reverse pass: the fused
+# kernels with the statistics of the forward pass, cuDNN for `batchnorm` on a GPU, and the
+# running statistics updated once. Without the rules Enzyme differentiates the generic code,
+# which `within_gradient` selects in the code Enzyme differentiates; forward mode still does.
+
+_enz_cached(x, overwritten::Bool) = overwritten && x isa AbstractArray ? copy(x) : x
+
+_enz_cotangent(::ChainRulesCore.AbstractZero) = nothing
+_enz_cotangent(dx) = dx
+
+_enz_zero(config, x::EnzymeCore.Active) =
+    EnzymeRules.width(config) == 1 ? zero(x.val) : ntuple(_ -> zero(x.val), Val(EnzymeRules.width(config)))
+_enz_zero(config, x) = nothing
+
+# `f(args..., rest...; kwargs...)`, differentiable in the arrays `args`.
+function _enz_rrule_augmented(config, ::Type{RT}, f, args::Tuple, rest::Tuple; kwargs...) where {RT}
+    ow = EnzymeRules.overwritten(config)
+    vals = ntuple(i -> _enz_cached(args[i].val, ow[i + 1]), Val(length(args)))
+    y, pullback = ChainRulesCore.rrule(f, vals..., map(a -> a.val, rest)...; kwargs...)
+    # the primal and shadow types must be concrete, which inference may not find
+    return _enz_alloc_augmented(config, y::eltype(RT), args, (pullback,))
+end
+
+function _enz_rrule_reverse!(config, cache, args::Tuple, rest::Tuple)
+    shadow, dvals, pullback = cache
+    if shadow !== nothing
+        _enz_alloc_reverse!(config, shadow, dvals, function (dy)
+            dargs = pullback(dy)
+            ntuple(i -> _enz_cotangent(dargs[i + 1]), Val(length(args)))
+        end)
+    end
+    return (map(_ -> nothing, args)..., map(x -> _enz_zero(config, x), rest)...)
+end
+
+const AffineNorm = Union{typeof(NNlib.batchnorm), typeof(NNlib.instancenorm),
+                         typeof(NNlib.groupnorm), typeof(NNlib.layernorm)}
+
+# `eps` is a number Enzyme cannot prove constant when it is read from a model.
+EnzymeRules.inactive_kwarg(::AffineNorm, args...; kwargs...) = nothing
+EnzymeRules.inactive_kwarg(::typeof(NNlib.rmsnorm), args...; kwargs...) = nothing
+
+# The rules are called, not inlined: Enzyme compiles an inlined rule as code it
+# differentiates, where `within_gradient` is `true` and the `rrule` takes the generic code.
+# `rest` is the running statistics and the momentum, or the number of groups.
+@noinline EnzymeRules.augmented_primal(config::EnzymeRules.RevConfig, func::EnzymeCore.Const{<:AffineNorm},
+        ::Type{RT}, g, b, x::EnzymeCore.Annotation{<:AbstractArray},
+        rest::Vararg{EnzymeCore.Annotation,N}; kwargs...) where {RT,N} =
+    _enz_rrule_augmented(config, RT, func.val, (g, b, x), rest; kwargs...)
+
+@noinline EnzymeRules.reverse(config::EnzymeRules.RevConfig, func::EnzymeCore.Const{<:AffineNorm},
+        ::Type{RT}, cache, g, b, x::EnzymeCore.Annotation{<:AbstractArray},
+        rest::Vararg{EnzymeCore.Annotation,N}; kwargs...) where {RT,N} =
+    _enz_rrule_reverse!(config, cache, (g, b, x), rest)
+
+@noinline EnzymeRules.augmented_primal(config::EnzymeRules.RevConfig, func::EnzymeCore.Const{typeof(NNlib.rmsnorm)},
+        ::Type{RT}, g, x::EnzymeCore.Annotation{<:AbstractArray}; kwargs...) where {RT} =
+    _enz_rrule_augmented(config, RT, func.val, (g, x), (); kwargs...)
+
+@noinline EnzymeRules.reverse(config::EnzymeRules.RevConfig, func::EnzymeCore.Const{typeof(NNlib.rmsnorm)},
+        ::Type{RT}, cache, g, x::EnzymeCore.Annotation{<:AbstractArray}; kwargs...) where {RT} =
+    _enz_rrule_reverse!(config, cache, (g, x), ())
+
+end
